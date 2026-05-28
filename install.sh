@@ -59,9 +59,12 @@ install_deps() {
 download_and_verify() {
     msg "[2/6] 查询 v2fly 官方最新版本..."
     local api="https://api.github.com/repos/v2fly/v2ray-core/releases/latest"
-    local ver
-    ver="$(curl -fsSL "$api" | grep -m1 '"tag_name"' | cut -d'"' -f4)"
-    [[ -n "$ver" ]] || die "获取最新版本失败,请检查服务器网络/DNS"
+    local ver resp
+    # 先把响应完整缓存到变量,避免 `curl | grep -m1` 中 grep 提前关管道
+    # 导致 curl 报 "(23) Failure writing output to destination"
+    resp="$(curl -fsSL "$api")" || die "获取最新版本失败,请检查服务器网络/DNS"
+    ver="$(printf '%s' "$resp" | grep -m1 '"tag_name"' | cut -d'"' -f4)"
+    [[ -n "$ver" ]] || die "解析最新版本失败(GitHub API 可能限流,请稍后重试)"
     msg "    最新版本: ${cyan}${ver}${none}"
 
     local base="https://github.com/v2fly/v2ray-core/releases/download/${ver}"
