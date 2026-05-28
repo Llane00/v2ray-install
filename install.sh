@@ -61,11 +61,16 @@ install_deps() {
 download_and_verify() {
     msg "[2/6] 查询 v2fly 官方最新版本..."
     local api="https://api.github.com/repos/v2fly/v2ray-core/releases/latest"
-    local ver resp
+    local resp ver=""
     # 先把响应完整缓存到变量,避免 `curl | grep -m1` 中 grep 提前关管道
     # 导致 curl 报 "(23) Failure writing output to destination"
-    resp="$(curl -fsSL "$api")" || die "获取最新版本失败,请检查服务器网络/DNS"
-    ver="$(printf '%s' "$resp" | grep -m1 '"tag_name"' | cut -d'"' -f4)"
+    resp="$(curl -fsSL --connect-timeout 15 --max-time 60 "$api")" \
+        || die "获取最新版本失败,请检查服务器到 api.github.com 的网络/DNS"
+    # 纯 Bash 正则提取,避免 `printf | grep -m1` 在 set -o pipefail 下因 SIGPIPE
+    # (大 JSON 写不进 64KB 管道缓冲、grep -m1 提前关管道)导致脚本静默中止
+    if [[ "$resp" =~ \"tag_name\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
+        ver="${BASH_REMATCH[1]}"
+    fi
     [[ -n "$ver" ]] || die "解析最新版本失败(GitHub API 可能限流,请稍后重试)"
     msg "    最新版本: ${cyan}${ver}${none}"
 
