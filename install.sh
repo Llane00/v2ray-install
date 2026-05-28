@@ -35,6 +35,14 @@ V2RAY_CONFIG="${V2RAY_CONFIG_DIR}/config.json"
 V2RAY_SERVICE="/etc/systemd/system/v2ray.service"
 V2RAY_LOG_DIR="/var/log/v2ray"
 
+# 临时目录用全局 EXIT trap 统一清理。
+# 不要在函数内用 `trap ... RETURN`:set -u 下它会泄漏到外层函数(do_install)返回时
+# 再次触发,而那时局部 $tmp 已不存在 → "tmp: unbound variable";且 RETURN trap 在
+# die(exit)时根本不触发,本就漏清理。EXIT trap 只触发一次,正常/异常退出都能清理。
+TMP_DIR=""
+cleanup() { [[ -n "${TMP_DIR:-}" ]] && rm -rf "${TMP_DIR}"; return 0; }
+trap cleanup EXIT
+
 # ---------------------------------------------------------------- 前置检查
 
 precheck() {
@@ -77,14 +85,14 @@ download_and_verify() {
 
     local base="https://github.com/v2fly/v2ray-core/releases/download/${ver}"
     local zip_name="v2ray-linux-${V2RAY_ARCH}.zip"
-    local tmp; tmp="$(mktemp -d)"
-    trap 'rm -rf "$tmp"' RETURN
+    TMP_DIR="$(mktemp -d)"; local tmp="$TMP_DIR"   # 由顶部的 EXIT trap 统一清理
 
     msg "[3/6] 下载二进制及校验文件 (正常 TLS 校验)..."
     # 不使用 --no-check-certificate:保证传输层不被中间人篡改
-    curl -fL --proto '=https' --tlsv1.2 -o "${tmp}/${zip_name}" "${base}/${zip_name}" \
-        || die "下载 ${zip_name} 失败"
-    curl -fL --proto '=https' --tlsv1.2 -o "${tmp}/${zip_name}.dgst" "${base}/${zip_name}.dgst" \
+    # --connect-timeout 限制连接阶段(避免网络不通时无限挂起);不限制总时长,允许慢速大文件下载
+    curl -fL --connect-timeout 15 --proto '=https' --tlsv1.2 -o "${tmp}/${zip_name}" "${base}/${zip_name}" \
+        || die "下载 ${zip_name} 失败(检查服务器到 github.com 的网络)"
+    curl -fL --connect-timeout 15 --proto '=https' --tlsv1.2 -o "${tmp}/${zip_name}.dgst" "${base}/${zip_name}.dgst" \
         || die "下载校验文件 .dgst 失败"
 
     msg "[4/6] 校验官方 SHA256..."
@@ -372,8 +380,8 @@ UsePAM yes"
 
 get_ip() {
     local ip
-    ip="$(curl -fsSL --proto '=https' https://api.ipify.org 2>/dev/null)" \
-        || ip="$(curl -fsSL https://api.ip.sb/ip 2>/dev/null)" \
+    ip="$(curl -fsSL --connect-timeout 5 --max-time 10 --proto '=https' https://api.ipify.org 2>/dev/null)" \
+        || ip="$(curl -fsSL --connect-timeout 5 --max-time 10 https://api.ip.sb/ip 2>/dev/null)" \
         || ip="你的服务器IP"
     echo "$ip"
 }
