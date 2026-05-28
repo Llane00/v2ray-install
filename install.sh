@@ -14,6 +14,7 @@
 #
 # 可选环境变量(非交互场景):
 #   V2RAY_PORT=12345   指定端口,缺省随机 (20000-65535)
+#                      (随机端口用 /dev/urandom 取值,覆盖整个区间)
 #   V2RAY_UUID=...     指定 UUID,缺省自动生成
 #   SSH_PORT=2222      指定新 SSH 端口,缺省保持 22
 #   SSH_USER=alice     【必填】要创建的登录用户名,会自动建号并从 root 复制公钥
@@ -48,10 +49,11 @@ precheck() {
 }
 
 install_deps() {
-    msg "[1/6] 安装依赖 (curl wget unzip ca-certificates ufw openssl)..."
+    msg "[1/6] 安装依赖 (curl wget unzip ca-certificates ufw openssl sudo)..."
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y >/dev/null
-    apt-get install -y curl wget unzip ca-certificates ufw openssl >/dev/null
+    # 极简 Debian 镜像可能没有 sudo(连 sudo 组都不存在),后面 usermod -aG sudo 会失败,故一并安装
+    apt-get install -y curl wget unzip ca-certificates ufw openssl sudo >/dev/null
 }
 
 # ---------------------------------------------------------------- 下载 + 校验
@@ -104,6 +106,15 @@ download_and_verify() {
 
 # ---------------------------------------------------------------- 生成配置
 
+# 生成 20000-65535 的随机端口。
+# 注意:不能用 `RANDOM % 45535`,因为 $RANDOM 上限仅 32767,取模等于空操作,
+# 实际只会落在 20000-52767。这里用 /dev/urandom 取 16 位无符号数覆盖整个区间。
+rand_port() {
+    local n
+    n="$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')"   # 0-65535
+    echo $(( n % 45536 + 20000 ))                      # 20000-65535
+}
+
 gen_config() {
     msg "[6/6] 生成配置、服务与防火墙规则..."
 
@@ -111,11 +122,11 @@ gen_config() {
     if [[ -n "${V2RAY_PORT:-}" ]]; then
         PORT="$V2RAY_PORT"
     elif [[ -t 0 ]]; then
-        local rnd=$(( RANDOM % 45535 + 20000 ))
+        local rnd; rnd="$(rand_port)"
         read -rp "$(echo -e "请输入 V2Ray 端口 [回车随机 ${cyan}${rnd}${none}]: ")" PORT
         PORT="${PORT:-$rnd}"
     else
-        PORT=$(( RANDOM % 45535 + 20000 ))
+        PORT="$(rand_port)"
     fi
     [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) || die "端口非法: $PORT"
 

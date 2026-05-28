@@ -63,7 +63,7 @@ bash <(curl -s -L https://raw.githubusercontent.com/Llane00/v2ray-install/main/i
 ## 脚本做了什么
 
 1. **前置检查**:必须 root、仅 Debian/Ubuntu(apt + systemd)、CPU 为 amd64 或 arm64。
-2. **安装依赖**:`curl wget unzip ca-certificates ufw openssl`。
+2. **安装依赖**:`curl wget unzip ca-certificates ufw openssl sudo`。
 3. **下载并校验**:取 v2fly 最新版本 → 下载 `.zip` 与 `.zip.dgst` → 校验 SHA256。
 4. **安装文件**:
    - 二进制 → `/usr/local/bin/v2ray`
