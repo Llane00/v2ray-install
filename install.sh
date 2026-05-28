@@ -16,7 +16,8 @@
 #   V2RAY_PORT=12345   指定端口,缺省随机 (20000-65535)
 #   V2RAY_UUID=...     指定 UUID,缺省自动生成
 #   SSH_PORT=2222      指定新 SSH 端口,缺省保持 22
-#   SSH_USER=alice     额外检测该用户的公钥(除 root 与 sudo 调用者之外)
+#   SSH_USER=alice     【必填】要创建的登录用户名,会自动建号并从 root 复制公钥
+#                      (非交互模式必须提供;交互模式会提示输入)
 
 set -euo pipefail
 
@@ -47,10 +48,10 @@ precheck() {
 }
 
 install_deps() {
-    msg "[1/6] 安装依赖 (curl wget unzip ca-certificates ufw)..."
+    msg "[1/6] 安装依赖 (curl wget unzip ca-certificates ufw openssl)..."
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y >/dev/null
-    apt-get install -y curl wget unzip ca-certificates ufw >/dev/null
+    apt-get install -y curl wget unzip ca-certificates ufw openssl >/dev/null
 }
 
 # ---------------------------------------------------------------- 下载 + 校验
@@ -219,38 +220,84 @@ setup_ufw() {
     msg "    ufw 已启用"
 }
 
-# SSH 加固:禁用密码登录,仅允许公钥;可改默认端口
-harden_ssh() {
-    msg "[SSH 加固] 检查公钥并禁用密码登录..."
+# 强制创建登录用户,并从 root 复制公钥(用户名必填)
+create_login_user() {
+    # 确定用户名(强制,必须提供)
+    if [[ -z "${SSH_USER:-}" ]]; then
+        if [[ -t 0 ]]; then
+            while [[ -z "${SSH_USER:-}" ]]; do
+                read -rp "$(echo -e "请输入要创建的登录用户名 (${red}必填${none}): ")" SSH_USER
+            done
+        else
+            die "必须通过 SSH_USER=<用户名> 指定要创建的登录用户"
+        fi
+    fi
+    [[ "$SSH_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "用户名不合法: ${SSH_USER}(仅限小写字母/数字/下划线/连字符,且不以数字开头)"
+    [[ "$SSH_USER" == "root" ]] && die "登录用户不能是 root,请另选用户名"
 
-    # 防呆:必须已存在可用公钥,否则拒绝禁用密码登录(防止锁死)
-    # 候选用户:root + sudo 调用者 + 用户指定的额外用户(SSH_USER 或交互输入)
-    local users=("root")
-    [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]] && users+=("$SUDO_USER")
-    if [[ -n "${SSH_USER:-}" ]]; then
-        users+=("$SSH_USER")
-    elif [[ -t 0 ]]; then
-        local extra
-        read -rp "$(echo -e "如需额外检测某个用户的公钥,请输入用户名 [回车跳过]: ")" extra
-        [[ -n "$extra" ]] && users+=("$extra")
+    msg "[用户] 创建登录用户 ${cyan}${SSH_USER}${none} 并复制 root 公钥..."
+
+    # 源:root 必须有可用公钥,否则复制后会锁死
+    local root_ak="/root/.ssh/authorized_keys"
+    if [[ ! -s "$root_ak" ]] || ! grep -qE '^[[:space:]]*(ssh-(rsa|ed25519|dss)|ecdsa-|sk-)' "$root_ak"; then
+        die "/root/.ssh/authorized_keys 中没有有效公钥,无法复制。
+为防止锁死已终止,请先为 root 配置好 SSH 公钥后重试。"
     fi
 
-    local key_found="" u home akf
-    for u in "${users[@]}"; do
-        home="$(getent passwd "$u" | cut -d: -f6)"
-        if [[ -z "$home" ]]; then
-            warn "    用户 ${u} 不存在,跳过"
-            continue
-        fi
-        akf="${home}/.ssh/authorized_keys"
-        if [[ -s "$akf" ]] && grep -qE '^[[:space:]]*(ssh-(rsa|ed25519|dss)|ecdsa-|sk-)' "$akf"; then
-            key_found=1
-            msg "    检测到公钥: ${akf} (用户 ${u})"
-        fi
-    done
-    [[ -n "$key_found" ]] || die "未检测到任何 SSH 公钥 (检测用户: ${users[*]})。
-为防止锁死,已拒绝禁用密码登录。请先用 ssh-copy-id 配置好公钥,
-或通过 SSH_USER=<用户名> 指定正确的登录用户后重试。"
+    # 创建用户(若不存在);已存在则复用,不破坏其原有 key
+    if id "$SSH_USER" >/dev/null 2>&1; then
+        warn "    用户 ${SSH_USER} 已存在,将复用(原有公钥会保留,密码会被重置)"
+    else
+        useradd -m -s /bin/bash "$SSH_USER"
+        msg "    已创建用户 ${SSH_USER}"
+    fi
+
+    # 赋予 sudo 权限
+    usermod -aG sudo "$SSH_USER"
+    msg "    已加入 sudo 组"
+
+    # 生成随机密码(用于 sudo / 控制台登录;SSH 仍为仅公钥)
+    local raw
+    raw="$(openssl rand -base64 24 2>/dev/null || true)"
+    raw="${raw//[^A-Za-z0-9]/}"
+    GEN_PASSWORD="${raw:0:16}"
+    [[ ${#GEN_PASSWORD} -ge 12 ]] || die "生成随机密码失败,请确认 openssl 可用"
+    printf '%s:%s\n' "$SSH_USER" "$GEN_PASSWORD" | chpasswd
+    msg "    已设置随机密码(安装结束后会打印)"
+
+    local home grp ak
+    home="$(getent passwd "$SSH_USER" | cut -d: -f6)"
+    [[ -n "$home" ]] || die "无法获取用户 ${SSH_USER} 的家目录"
+    grp="$(id -gn "$SSH_USER")"
+    ak="${home}/.ssh/authorized_keys"
+
+    mkdir -p "${home}/.ssh"
+    touch "$ak"
+    # 追加 root 的公钥(逐行去重,不覆盖该用户已有的 key)
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        grep -qxF "$line" "$ak" || printf '%s\n' "$line" >> "$ak"
+    done < "$root_ak"
+
+    chmod 700 "${home}/.ssh"
+    chmod 600 "$ak"
+    chown -R "${SSH_USER}:${grp}" "${home}/.ssh"
+    msg "    已将 root 公钥复制到 ${ak}"
+}
+
+# SSH 加固:禁用密码登录,仅允许公钥;可改默认端口
+harden_ssh() {
+    msg "[SSH 加固] 校验公钥并禁用密码登录..."
+
+    # 防呆:root 登录将被禁用,唯一入口是新用户,故必须确认新用户有可用公钥(否则锁死)
+    local home akf
+    home="$(getent passwd "$SSH_USER" | cut -d: -f6)"
+    akf="${home}/.ssh/authorized_keys"
+    if [[ ! -s "$akf" ]] || ! grep -qE '^[[:space:]]*(ssh-(rsa|ed25519|dss)|ecdsa-|sk-)' "$akf"; then
+        die "用户 ${SSH_USER} 没有可用公钥;禁用 root 登录后将无法登录,已终止以防锁死。"
+    fi
+    msg "    确认登录入口公钥: ${akf} (用户 ${SSH_USER})"
 
     local sshd_main="/etc/ssh/sshd_config"
     local dropin_dir="/etc/ssh/sshd_config.d"
@@ -260,7 +307,7 @@ PasswordAuthentication no
 PubkeyAuthentication yes
 KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
-PermitRootLogin prohibit-password
+PermitRootLogin no
 UsePAM yes"
     local applied=""
 
@@ -335,15 +382,20 @@ EOF
     echo "  配置文件 : ${V2RAY_CONFIG}"
     echo "--------------------------------------------"
     echo -e "  SSH 端口 : ${cyan}${SSH_PORT}${none}"
-    echo -e "  密码登录 : ${cyan}已禁用 (仅允许公钥)${none}"
+    echo -e "  登录用户 : ${cyan}${SSH_USER}${none} (已复制 root 公钥, 已加 sudo)"
+    echo -e "  用户密码 : ${cyan}${GEN_PASSWORD}${none}  (用于 sudo / 控制台, 非 SSH 登录)"
+    echo -e "  root登录 : ${cyan}已禁用${none}"
+    echo -e "  SSH 登录 : ${cyan}已禁用密码, 仅允许公钥${none}"
     echo "============================================"
     echo
-    warn "重要:下次登录请使用新端口与公钥:"
-    warn "      ssh -p ${SSH_PORT} <用户>@${ip}"
-    warn "请保持当前这个 SSH 会话不要断开,先开新窗口验证能用新端口登录,再关闭旧会话!"
+    warn "重要:root 登录已禁用!以后只能用新用户 + 公钥 + 新端口登录:"
+    warn "      ssh -p ${SSH_PORT} ${SSH_USER}@${ip}"
+    warn "请务必保持当前会话不要断开,先开新窗口用上面命令验证登录成功,再关闭当前会话!"
     if [[ "$SSH_PORT" != "22" ]]; then
         warn "另外:云厂商控制台的安全组/防火墙也要放行 TCP ${SSH_PORT},否则会连不上。"
     fi
+    echo
+    warn "请立刻保存上面的【用户密码】,它不会再次显示;sudo 与控制台登录都需要它。"
     echo
 }
 
@@ -371,6 +423,7 @@ install() {
     verify_config
     install_service
     prompt_ssh_port
+    create_login_user
     setup_ufw
     harden_ssh
     sleep 1
