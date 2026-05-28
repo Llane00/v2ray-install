@@ -216,6 +216,31 @@ EOF
     systemctl restart v2ray
 }
 
+# ---------------------------------------------------------------- BBR 加速
+
+# 开启 BBR 拥塞控制 + fq 队列(提升跨境/丢包链路的吞吐)。
+# 幂等:写独立 drop-in 文件,重复运行直接覆盖,不污染 /etc/sysctl.conf。
+# 内核不支持时只 warn 跳过,不中断安装。
+setup_bbr() {
+    msg "[BBR] 开启 BBR 拥塞控制 + fq 队列..."
+    cat > /etc/sysctl.d/99-bbr.conf <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+    modprobe tcp_bbr 2>/dev/null || true
+    sysctl --system >/dev/null 2>&1 || true
+
+    # 验证是否真生效(老内核会静默回退到原算法)
+    local cc qd
+    cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+    qd="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
+    if [[ "$cc" == "bbr" ]]; then
+        msg "    已启用 BBR (qdisc=${qd:-未知})"
+    else
+        warn "    当前内核未启用 BBR (拥塞控制=${cc:-未知});可能内核过旧不支持,已跳过(不影响其余安装)"
+    fi
+}
+
 # ---------------------------------------------------------------- 防火墙
 
 # 确定 SSH 端口(用户自定义,默认保持 22)
@@ -460,6 +485,7 @@ do_install() {
     gen_config
     verify_config
     install_service
+    setup_bbr
     prompt_ssh_port
     create_login_user
     setup_ufw
