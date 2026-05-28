@@ -230,7 +230,11 @@ prompt_ssh_port() {
     fi
     [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && (( SSH_PORT >= 1 && SSH_PORT <= 65535 )) \
         || die "SSH 端口非法: $SSH_PORT"
-    [[ "$SSH_PORT" == "$PORT" ]] && die "SSH 端口不能与 V2Ray 端口 ($PORT) 相同"
+    # 用 if 而非 `[[ ]] && die`:后者作为函数最后一行,正常情况(端口不等)会返回 1,
+    # 触发外层 do_install 的 set -e 静默退出(脚本会停在这里,v2ray 已起但不再继续)。
+    if [[ "$SSH_PORT" == "$PORT" ]]; then
+        die "SSH 端口不能与 V2Ray 端口 ($PORT) 相同"
+    fi
 }
 
 # 配置 ufw:默认拒绝入站、放行出站,只开放 SSH 与 V2Ray 端口
