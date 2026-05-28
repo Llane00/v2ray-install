@@ -22,10 +22,13 @@
 
 > GitHub 网页地址(`/blob/`)不能直接执行,必须用 **raw** 地址。
 
+> 推荐**先下载到本地再执行**:可以先 `cat install.sh` 审查内容,执行时也保留了正常的标准输入(交互式输入正常),出问题更好排查。
+
 ### 安装(交互式)
 
 ```bash
-bash <(curl -s -L https://raw.githubusercontent.com/Llane00/v2ray-install/main/install.sh)
+curl -fsSL -o install.sh https://raw.githubusercontent.com/Llane00/v2ray-install/main/install.sh
+bash install.sh
 ```
 
 会依次提示输入:V2Ray 端口、SSH 端口、要创建的登录用户名。
@@ -33,17 +36,23 @@ bash <(curl -s -L https://raw.githubusercontent.com/Llane00/v2ray-install/main/i
 ### 安装(全自动,不交互)
 
 ```bash
-SSH_PORT=2222 V2RAY_PORT=31535 SSH_USER=你的登录用户名 \
-  bash <(curl -s -L https://raw.githubusercontent.com/Llane00/v2ray-install/main/install.sh)
+curl -fsSL -o install.sh https://raw.githubusercontent.com/Llane00/v2ray-install/main/install.sh
+SSH_PORT=2222 V2RAY_PORT=31535 SSH_USER=你的登录用户名 bash install.sh
 ```
 
 ### 卸载
 
 ```bash
-bash <(curl -s -L https://raw.githubusercontent.com/Llane00/v2ray-install/main/install.sh) uninstall
+curl -fsSL -o install.sh https://raw.githubusercontent.com/Llane00/v2ray-install/main/install.sh
+bash install.sh uninstall
 ```
 
-> 用 `bash <(...)` 而非 `curl | bash`:前者保留了标准输入,交互式输入才能正常工作。
+> 不建议用 `bash <(curl ...)` 或 `curl | bash` 直接执行:脚本中途出错难以排查,且管道/进程替换在某些情况下会干扰脚本对标准输入的读取。
+>
+> `raw.githubusercontent.com` 有约 5 分钟 CDN 缓存。刚 push 完想立刻拉到新版,可在 URL 末尾加时间戳绕过缓存:
+> ```bash
+> curl -fsSL -o install.sh "https://raw.githubusercontent.com/Llane00/v2ray-install/main/install.sh?cb=$(date +%s)"
+> ```
 
 ---
 
