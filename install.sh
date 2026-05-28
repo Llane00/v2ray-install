@@ -8,9 +8,10 @@
 #   - 不关闭系统防火墙,只精确放行 V2Ray 用到的那一个端口
 #   - 不上传任何配置到第三方
 #
-# 用法:
-#   bash <(curl -s -L https://你的域名/v2ray-install)            # 安装
-#   bash <(curl -s -L https://你的域名/v2ray-install) uninstall  # 卸载
+# 用法(推荐先下载再执行,便于审查内容、排查问题):
+#   curl -fsSL -o install.sh https://你的域名/install.sh
+#   bash install.sh             # 安装
+#   bash install.sh uninstall   # 卸载
 #
 # 可选环境变量(非交互场景):
 #   V2RAY_PORT=12345   指定端口,缺省随机 (20000-65535)
@@ -434,7 +435,9 @@ uninstall() {
 
 # ---------------------------------------------------------------- 主流程
 
-install() {
+# 注意:函数名不能叫 install,否则会覆盖 /usr/bin/install 命令,
+# 导致 download_and_verify 里的 `install -m 755 ...` 递归调用本函数而死循环。
+do_install() {
     precheck
     install_deps
     download_and_verify
@@ -451,7 +454,7 @@ install() {
 }
 
 case "${1:-install}" in
-    install)   install ;;
+    install)   do_install ;;
     uninstall) uninstall ;;
     *) die "未知参数: $1 (可用: install | uninstall)" ;;
 esac
