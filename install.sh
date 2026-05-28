@@ -174,8 +174,12 @@ EOF
 verify_config() {
     msg "    自检: 校验二进制与配置..."
     local ver_out
-    ver_out="$("${V2RAY_BIN_DIR}/v2ray" version 2>/dev/null | head -1)" \
+    # 不用 `... | head -1`:v2ray version 逐行输出,head 读完首行就关管道,
+    # set -o pipefail 下 v2ray 写后续行会收到 SIGPIPE(退出 141),被误判为"二进制无法执行"。
+    # 先整体捕获(无管道),再用 bash 参数展开取首行。
+    ver_out="$("${V2RAY_BIN_DIR}/v2ray" version 2>/dev/null)" \
         || die "二进制无法执行,安装可能损坏"
+    ver_out="${ver_out%%$'\n'*}"
     msg "    二进制: ${cyan}${ver_out}${none}"
 
     # v5: `v2ray test -config`  /  v4: `v2ray -test -config`
