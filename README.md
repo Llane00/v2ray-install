@@ -13,7 +13,7 @@
 - **不关闭防火墙**,而是用 `ufw` 做「默认拒绝入站 + 只放行必要端口」。
 - 安装前做**配置自检**(`v2ray test -config`),不合法就不启动服务。
 - **SSH 加固**:禁用密码登录、**禁用 root 登录**、仅允许公钥、可自定义 SSH 端口;自动创建专用 sudo 用户作为唯一登录入口。
-- **不上传任何配置到第三方**,只在本地打印 `vmess://` 导入链接。
+- **不上传任何配置到第三方**,只在本地打印 `vmess://` 导入链接(并附 Clash / Mihomo 可直接粘贴的 YAML 配置)。
 - 单文件、无外部子脚本依赖。
 
 ---
@@ -39,6 +39,16 @@ bash install.sh
 curl -fsSL -o install.sh https://raw.githubusercontent.com/Llane00/v2ray-install/main/install.sh
 SSH_PORT=2222 V2RAY_PORT=31535 SSH_USER=你的登录用户名 bash install.sh
 ```
+
+### 重新获取连接信息(已经装过的机器)
+
+想再次拿到 `vmess://` 链接或 Clash 配置时,**不要重跑安装**——重装会生成新的 UUID / 端口,等于换了节点,现有客户端会全部失效。直接在服务器上执行:
+
+```bash
+bash install.sh info
+```
+
+会从现有 `/usr/local/etc/v2ray/config.json` 读出端口与 UUID,重新打印 `vmess://` 链接和 Clash YAML。**纯只读,不改动任何配置或服务。**
 
 ### 卸载
 
@@ -115,7 +125,7 @@ bash install.sh uninstall
 
 脚本会一次性打印:
 
-- **V2Ray**:地址、端口、UUID,以及可直接导入客户端的 `vmess://` 链接
+- **V2Ray**:地址、端口、UUID、可直接导入 v2rayN/NG 等客户端的 `vmess://` 链接,以及给 Clash / Mihomo 用的 YAML 配置片段
 - **服务器登录**:新用户名、随机密码(用于 sudo / 控制台)、SSH 端口
 
 登录服务器(root 已禁用,只能用新用户 + 公钥):
@@ -131,6 +141,8 @@ systemctl status  v2ray
 systemctl restart v2ray
 systemctl stop    v2ray
 ```
+
+> 想再次查看连接信息(`vmess://` 链接 + Clash 配置),在服务器上运行 `bash install.sh info`(只读,不改动配置)。
 
 ---
 

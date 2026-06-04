@@ -11,6 +11,7 @@
 # 用法(推荐先下载再执行,便于审查内容、排查问题):
 #   curl -fsSL -o install.sh https://你的域名/install.sh
 #   bash install.sh             # 安装
+#   bash install.sh info        # 重新打印连接信息(vmess 链接 + Clash 配置),只读
 #   bash install.sh uninstall   # 卸载
 #
 # 可选环境变量(非交互场景):
@@ -419,7 +420,9 @@ get_ip() {
     echo "$ip"
 }
 
-print_result() {
+# 渲染节点连接信息:VMess 头部 + vmess:// 链接 + Clash YAML。
+# 安装结束(print_result)与 `info` 子命令共用,依赖全局 PORT / UUID / V2RAY_VERSION。
+print_node_info() {
     local ip; ip="$(get_ip)"
     local vmess_json
     vmess_json="$(cat <<EOF
@@ -428,8 +431,6 @@ EOF
 )"
     local link="vmess://$(echo -n "$vmess_json" | base64 -w 0)"
 
-    echo
-    echo "================= 安装完成 ================="
     echo -e "  版本     : ${cyan}${V2RAY_VERSION}${none}"
     echo -e "  地址     : ${cyan}${ip}${none}"
     echo -e "  端口     : ${cyan}${PORT}${none}"
@@ -438,6 +439,30 @@ EOF
     echo -e "  传输     : ${cyan}VMess + TCP${none}"
     echo
     echo -e "  导入链接 : ${green}${link}${none}"
+    echo
+    echo -e "  ${cyan}Clash / Mihomo${none}(vmess:// 链接 Clash 系不识别,改用下面这段 YAML):"
+    echo -e "  ${yellow}整段贴进你的 Clash 配置;若已有 proxies:,只取「- name」那条追加到其下${none}"
+    echo
+    # 故意顶格输出(不跟随上面的缩进框):Clash 的 proxies: 必须在 YAML 顶层,
+    # 顶格才能整段直接粘贴。内部不加颜色,避免 ANSI 码混进 YAML 破坏复制。
+    cat <<EOF
+proxies:
+  - name: "v2ray-${ip}"
+    type: vmess
+    server: ${ip}
+    port: ${PORT}
+    uuid: ${UUID}
+    alterId: 0
+    cipher: auto
+    network: tcp
+    udp: true
+EOF
+}
+
+print_result() {
+    echo
+    echo "================= 安装完成 ================="
+    print_node_info
     echo
     echo "  管理命令 : systemctl {status|restart|stop} v2ray"
     echo "  配置文件 : ${V2RAY_CONFIG}"
@@ -457,6 +482,41 @@ EOF
     fi
     echo
     warn "请立刻保存上面的【用户密码】,它不会再次显示;sudo 与控制台登录都需要它。"
+    echo
+}
+
+# ---------------------------------------------------------------- info 子命令
+
+# `info` 子命令:从已安装的 config.json 读取端口 / UUID,重新打印节点连接信息
+# (vmess:// 链接 + Clash YAML)。纯只读,不改动任何配置或服务。
+# 用途:之前装过、想再次拿到连接信息时,无需(也不应)重跑安装——重装会生成
+# 新的 UUID/端口,等于换了节点,现有客户端全部失效。
+show_info() {
+    [[ -f "$V2RAY_CONFIG" ]] || die "未找到 ${V2RAY_CONFIG},请确认已用本脚本安装过 V2Ray"
+    [[ -r "$V2RAY_CONFIG" ]] || die "无权读取 ${V2RAY_CONFIG},请用 root 运行: sudo bash $0 info"
+
+    # 解析端口与 UUID:沿用脚本一贯的「整体捕获 + 参数展开」写法,不经管道,
+    # 避免 grep | head 在 set -o pipefail 下因 SIGPIPE 误伤(理由同 verify_config)。
+    local praw uraw
+    praw="$(grep -oE '"port"[[:space:]]*:[[:space:]]*[0-9]+' "$V2RAY_CONFIG" || true)"
+    praw="${praw%%$'\n'*}"            # 仅取第一行,形如 '"port": 31535'
+    PORT="${praw##*[!0-9]}"           # 删掉末尾连续数字之前的全部字符 → 纯端口号
+    uraw="$(grep -oiE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' "$V2RAY_CONFIG" || true)"
+    UUID="${uraw%%$'\n'*}"
+    [[ -n "$PORT" && -n "$UUID" ]] || die "无法从 ${V2RAY_CONFIG} 解析端口/UUID(配置可能被手动改过)"
+
+    # 版本:整体捕获二进制输出取首行(不用 head,理由同 verify_config);取不到则标「未知」
+    local vraw=""
+    if [[ -x "${V2RAY_BIN_DIR}/v2ray" ]]; then
+        vraw="$("${V2RAY_BIN_DIR}/v2ray" version 2>/dev/null || true)"
+    fi
+    V2RAY_VERSION="${vraw%%$'\n'*}"
+    V2RAY_VERSION="${V2RAY_VERSION:-未知}"
+
+    echo
+    echo "================ 节点连接信息 ================"
+    print_node_info
+    echo "============================================="
     echo
 }
 
@@ -498,5 +558,6 @@ do_install() {
 case "${1:-install}" in
     install)   do_install ;;
     uninstall) uninstall ;;
-    *) die "未知参数: $1 (可用: install | uninstall)" ;;
+    info)      show_info ;;
+    *) die "未知参数: $1 (可用: install | uninstall | info)" ;;
 esac
