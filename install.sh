@@ -440,12 +440,19 @@ EOF
     echo
     echo -e "  导入链接 : ${green}${link}${none}"
     echo
-    echo -e "  ${cyan}Clash / Mihomo${none}(vmess:// 链接 Clash 系不识别,改用下面这段 YAML):"
-    echo -e "  ${yellow}整段贴进你的 Clash 配置;若已有 proxies:,只取「- name」那条追加到其下${none}"
+    echo -e "  ${cyan}Clash / Mihomo${none}(vmess:// 链接 Clash 系不识别,用下面这份完整配置):"
+    echo -e "  ${yellow}Clash Verge:新建配置 → 类型选「Local / 本地」→ 粘贴整份 → 保存启用${none}"
+    echo -e "  ${yellow}已有 Clash 配置:只取下面 proxies: 那一段,加进你现有配置即可${none}"
     echo
-    # 故意顶格输出(不跟随上面的缩进框):Clash 的 proxies: 必须在 YAML 顶层,
-    # 顶格才能整段直接粘贴。内部不加颜色,避免 ANSI 码混进 YAML 破坏复制。
+    # 故意顶格输出(不跟随上面的缩进框):Clash 配置的顶层键必须在 YAML 第 0 列,
+    # 顶格才能整份直接粘贴。内部不加颜色,避免 ANSI 码混进 YAML 破坏复制。
+    # 这是一份「完整可跑」的最小配置(proxies + proxy-groups + rules),
+    # 因为独立的本地配置必须含路由规则才能真正分流;只有 proxies 段 Clash 起不来。
     cat <<EOF
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
 proxies:
   - name: "v2ray-${ip}"
     type: vmess
@@ -456,6 +463,15 @@ proxies:
     cipher: auto
     network: tcp
     udp: true
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - "v2ray-${ip}"
+      - DIRECT
+rules:
+  - GEOIP,CN,DIRECT
+  - MATCH,PROXY
 EOF
 }
 

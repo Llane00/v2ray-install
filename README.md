@@ -13,7 +13,7 @@
 - **不关闭防火墙**,而是用 `ufw` 做「默认拒绝入站 + 只放行必要端口」。
 - 安装前做**配置自检**(`v2ray test -config`),不合法就不启动服务。
 - **SSH 加固**:禁用密码登录、**禁用 root 登录**、仅允许公钥、可自定义 SSH 端口;自动创建专用 sudo 用户作为唯一登录入口。
-- **不上传任何配置到第三方**,只在本地打印 `vmess://` 导入链接(并附 Clash / Mihomo 可直接粘贴的 YAML 配置)。
+- **不上传任何配置到第三方**,只在本地打印 `vmess://` 导入链接(并附一份完整的 Clash / Mihomo 配置,可作为「本地配置」直接导入)。
 - 单文件、无外部子脚本依赖。
 
 ---
@@ -48,7 +48,7 @@ SSH_PORT=2222 V2RAY_PORT=31535 SSH_USER=你的登录用户名 bash install.sh
 bash install.sh info
 ```
 
-会从现有 `/usr/local/etc/v2ray/config.json` 读出端口与 UUID,重新打印 `vmess://` 链接和 Clash YAML。**纯只读,不改动任何配置或服务。**
+会从现有 `/usr/local/etc/v2ray/config.json` 读出端口与 UUID,重新打印 `vmess://` 链接和**完整 Clash 配置**。**纯只读,不改动任何配置或服务。**
 
 ### 卸载
 
@@ -125,8 +125,10 @@ bash install.sh uninstall
 
 脚本会一次性打印:
 
-- **V2Ray**:地址、端口、UUID、可直接导入 v2rayN/NG 等客户端的 `vmess://` 链接,以及给 Clash / Mihomo 用的 YAML 配置片段
+- **V2Ray**:地址、端口、UUID、可直接导入 v2rayN/NG 等客户端的 `vmess://` 链接,以及一份完整的 Clash / Mihomo 配置
 - **服务器登录**:新用户名、随机密码(用于 sudo / 控制台)、SSH 端口
+
+> **Clash 用户怎么导入**:打印出来的是一份**完整 Clash 配置**。Clash 加订阅通常是填 URL,但本脚本不托管订阅、不传第三方,所以走「本地配置」:Clash Verge 里点「新建」→ 类型选 **Local(本地)** → 把整份粘进去 → 保存启用即可。已有 Clash 配置的话,只取其中 `proxies:` 那段加进去。
 
 登录服务器(root 已禁用,只能用新用户 + 公钥):
 
