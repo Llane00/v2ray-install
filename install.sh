@@ -133,20 +133,32 @@ download_and_verify() {
 
 # ---------------------------------------------------------------- 生成密钥/配置
 
+# 解析 `xray x25519` 的输出,结果写入全局 PRIVATE_KEY / PUBLIC_KEY(找不到则留空)。
+# 必须兼容多版本不同的标签格式,逐行解析、靠关键字 + 长度判断,而非紧挨着的「标签: 值」正则:
+#   旧版:        "Private key: xxx"    / "Public key: yyy"
+#   中间版:      "PrivateKey: xxx"     / "Password: yyy"
+#   新版(v26+): "PrivateKey: xxx"     / "Password (PublicKey): yyy" / 末尾还多一行 "Hash32: zzz"
+# x25519 公私钥是 43 位 base64url;Hash32 也是 43 位,但它那行不含 private/public/password,故靠标签排除。
+_parse_x25519_keys() {
+    local out="$1" line val
+    PRIVATE_KEY=""; PUBLIC_KEY=""
+    while IFS= read -r line; do
+        val="${line##*:}"                 # 取最后一个冒号之后(避开 "Password (PublicKey):" 这种带括号的标签)
+        val="${val//[^A-Za-z0-9_-]/}"     # 只留 base64url 字符,顺带去掉空白/括号残留
+        [[ ${#val} -ge 40 ]] || continue  # 太短的不是 key(如空行、纯标签)
+        case "$line" in
+            *[Pp]rivate*)              if [[ -z "$PRIVATE_KEY" ]]; then PRIVATE_KEY="$val"; fi ;;
+            *[Pp]ublic*|*[Pp]assword*) if [[ -z "$PUBLIC_KEY"  ]]; then PUBLIC_KEY="$val";  fi ;;
+        esac
+    done <<< "$out"
+}
+
 # 生成 Reality x25519 密钥对。需要已安装的 xray 二进制(在 download_and_verify 之后调用)。
-# 不同 Xray 版本输出标签略有差异(Private key/PrivateKey、Public key/Password),用正则兼容。
 gen_reality_keys() {
     [[ -x "$XRAY_BIN" ]] || die "未找到可执行的 xray,无法生成 Reality 密钥"
     local out
     out="$("$XRAY_BIN" x25519 2>/dev/null)" || die "生成 Reality 密钥对失败 (xray x25519)"
-    PRIVATE_KEY=""; PUBLIC_KEY=""
-    # x25519 密钥是 43 位左右的 base64url,用 {40,} 把它和标签文字区分开
-    if [[ "$out" =~ [Pp]rivate[[:space:]_]?[Kk]ey:?[[:space:]]+([A-Za-z0-9_-]{40,}) ]]; then
-        PRIVATE_KEY="${BASH_REMATCH[1]}"
-    fi
-    if [[ "$out" =~ ([Pp]ublic[[:space:]_]?[Kk]ey|[Pp]assword):?[[:space:]]+([A-Za-z0-9_-]{40,}) ]]; then
-        PUBLIC_KEY="${BASH_REMATCH[2]}"
-    fi
+    _parse_x25519_keys "$out"
     [[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" ]] \
         || die "解析 Reality 密钥失败,xray x25519 输出异常:
 ${out}"
@@ -599,8 +611,9 @@ show_info() {
         local priv=""
         if [[ "$content" =~ \"privateKey\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9_-]+)\" ]]; then priv="${BASH_REMATCH[1]}"; fi
         if [[ -n "$priv" && -x "$XRAY_BIN" ]]; then
+            # 新版 xray 用 `xray x25519 -i <私钥>` 反推公钥;输出格式同 gen,交给同一解析器
             local d; d="$("$XRAY_BIN" x25519 -i "$priv" 2>/dev/null || true)"
-            if [[ "$d" =~ ([Pp]ublic[[:space:]_]?[Kk]ey|[Pp]assword):?[[:space:]]+([A-Za-z0-9_-]{40,}) ]]; then PUBLIC_KEY="${BASH_REMATCH[2]}"; fi
+            _parse_x25519_keys "$d"   # 设置 PUBLIC_KEY(也会动全局 PRIVATE_KEY,info 不使用,无影响)
         fi
     fi
     [[ -n "$PUBLIC_KEY" ]] || PUBLIC_KEY="(未知,请查看 ${XRAY_KEYS})"
