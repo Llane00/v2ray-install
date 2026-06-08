@@ -1,20 +1,45 @@
 # v2ray-install
 
-一个**纯净、可审计**的 V2Ray 一键安装脚本,面向 **Debian / Ubuntu**,传输协议为 **VMess + TCP**。
+一个**纯净、可审计**的代理一键安装脚本,面向 **Debian / Ubuntu**,内核为 **Xray-core**,传输协议为 **VLESS + Reality + Vision**。
 
-适用场景:在一台**已经配置好 SSH 公钥登录**的全新云服务器上,一条命令完成 V2Ray 安装 + 服务器基础加固。
+> 仓库名沿用 `v2ray-install`,但脚本已从 V2Ray(VMess + TCP)升级为 **Xray(VLESS + Reality)**,原因见下。
+
+适用场景:在一台**已经配置好 SSH 公钥登录**的全新云服务器上,一条命令完成代理安装 + 服务器基础加固。
+
+---
+
+## 为什么用 VLESS + Reality
+
+裸 VMess / VLESS over TCP 没有 TLS 伪装,流量特征明显,**IP 跑一段时间(常见 1-3 周)就会被 GFW 识别并封锁**——表现为服务端一切正常、但国内突然连不上。
+
+**Reality** 借用一个真实大站(默认 `www.microsoft.com`)的 TLS 握手来伪装:
+
+- **无需自己的域名和证书**,也不依赖 CDN;
+- 对**主动探测**有抵抗力(探测者只会看到那个真实大站的响应);
+- 配合 `xtls-rprx-vision` 流控,是目前(2025-2026)国内抗封锁综合表现最好、维护成本最低的方案之一。
 
 ---
 
 ## 特性
 
-- **二进制只从 [v2fly 官方仓库](https://github.com/v2fly/v2ray-core/releases) 下载**,并**强制校验官方 SHA256**,校验不通过立即终止。
+- **二进制只从 [XTLS/Xray-core 官方仓库](https://github.com/XTLS/Xray-core/releases) 下载**,并**强制校验官方 SHA256**,校验不通过立即终止。
 - 下载全程走正常 TLS(不使用 `--no-check-certificate`),并强制 `--proto =https --tlsv1.2`。
 - **不关闭防火墙**,而是用 `ufw` 做「默认拒绝入站 + 只放行必要端口」。
-- 安装前做**配置自检**(`v2ray test -config`),不合法就不启动服务。
+- 安装时自动生成 **Reality x25519 密钥对**与随机 shortId;公钥另存一份到 `reality.keys` 备份(客户端连接需要)。
+- 安装前做**配置自检**(`xray` 自带的 test),不合法就不启动服务。
+- 开启 **BBR + fq**(内核不支持则只告警跳过,不中断)。
 - **SSH 加固**:禁用密码登录、**禁用 root 登录**、仅允许公钥、可自定义 SSH 端口;自动创建专用 sudo 用户作为唯一登录入口。
-- **不上传任何配置到第三方**,只在本地打印 `vmess://` 导入链接(并附一份完整的 Clash / Mihomo 配置,可作为「本地配置」直接导入)。
+- **不上传任何配置到第三方**,只在本地打印 `vless://` 导入链接(并附一份完整的 Mihomo 配置,可作为「本地配置」直接导入)。
 - 单文件、无外部子脚本依赖。
+
+---
+
+## 客户端要求
+
+必须使用**支持 Reality + `xtls-rprx-vision`** 的客户端:
+
+- ✅ v2rayN / v2rayNG、NekoBox / sing-box、Shadowrocket(小火箭)、Clash Verge Rev(Mihomo 内核)等较新版本
+- ❌ **原版 Clash 不支持 VLESS / Reality**,Clash 用户必须用 **Mihomo 内核**(如 Clash Verge Rev)
 
 ---
 
@@ -31,24 +56,27 @@ curl -fsSL -o install.sh https://raw.githubusercontent.com/Llane00/v2ray-install
 bash install.sh
 ```
 
-会依次提示输入:V2Ray 端口、SSH 端口、要创建的登录用户名。
+会依次提示输入:Xray 端口(回车默认 443)、SSH 端口、要创建的登录用户名。
 
 ### 安装(全自动,不交互)
 
 ```bash
 curl -fsSL -o install.sh https://raw.githubusercontent.com/Llane00/v2ray-install/main/install.sh
-SSH_PORT=2222 V2RAY_PORT=31535 SSH_USER=你的登录用户名 bash install.sh
+SSH_PORT=2222 SSH_USER=你的登录用户名 bash install.sh
 ```
+
+> 端口缺省即 443(Reality 伪装成 HTTPS,落在 443 最自然);如需指定可加 `XRAY_PORT=...`。
+> 伪装站缺省 `www.microsoft.com`,如需更换可加 `REALITY_SNI=...`(要求:真实、支持 TLS1.3、国内可正常访问的大站)。
 
 ### 重新获取连接信息(已经装过的机器)
 
-想再次拿到 `vmess://` 链接或 Clash 配置时,**不要重跑安装**——重装会生成新的 UUID / 端口,等于换了节点,现有客户端会全部失效。直接在服务器上执行:
+想再次拿到 `vless://` 链接或 Clash 配置时,**不要重跑安装**——重装会生成新的 UUID / 端口 / 密钥,等于换了节点,现有客户端会全部失效。直接在服务器上执行:
 
 ```bash
 bash install.sh info
 ```
 
-会从现有 `/usr/local/etc/v2ray/config.json` 读出端口与 UUID,重新打印 `vmess://` 链接和**完整 Clash 配置**。**纯只读,不改动任何配置或服务。**
+会从现有 `/usr/local/etc/xray/config.json` 与 `reality.keys` 读出全部参数,重新打印 `vless://` 链接和**完整 Mihomo 配置**。**纯只读,不改动任何配置或服务。**
 
 ### 卸载
 
@@ -70,10 +98,11 @@ bash install.sh uninstall
 
 | 变量 | 说明 | 缺省 |
 |------|------|------|
-| `SSH_USER`   | **【必填】** 要创建的登录用户名,脚本会自动建号、加 sudo、生成随机密码并从 root 复制公钥 | 交互模式会提示输入;非交互模式必须提供 |
-| `SSH_PORT`   | 新的 SSH 端口 | 保持 `22` |
-| `V2RAY_PORT` | V2Ray 监听端口 | 随机 20000–65535 |
-| `V2RAY_UUID` | VMess UUID | 自动生成 |
+| `SSH_USER`    | **【必填】** 要创建的登录用户名,脚本会自动建号、加 sudo、生成随机密码并从 root 复制公钥 | 交互模式会提示输入;非交互模式必须提供 |
+| `SSH_PORT`    | 新的 SSH 端口 | 保持 `22` |
+| `XRAY_PORT`   | Xray 监听端口 | `443` |
+| `XRAY_UUID`   | VLESS UUID | 自动生成 |
+| `REALITY_SNI` | Reality 伪装目标站(同时用作 SNI 与中转 dest) | `www.microsoft.com` |
 
 > 用户名规则:`^[a-z_][a-z0-9_-]*$`(小写字母/数字/下划线/连字符,**不能以数字开头**)。例如 `llane`、`user1` 可以,`123` 不行。
 
@@ -83,17 +112,20 @@ bash install.sh uninstall
 
 1. **前置检查**:必须 root、仅 Debian/Ubuntu(apt + systemd)、CPU 为 amd64 或 arm64。
 2. **安装依赖**:`curl wget unzip ca-certificates ufw openssl sudo`。
-3. **下载并校验**:取 v2fly 最新版本 → 下载 `.zip` 与 `.zip.dgst` → 校验 SHA256。
+3. **下载并校验**:取 XTLS/Xray-core 最新版本 → 下载 `.zip` 与 `.zip.dgst` → 校验 SHA256。
 4. **安装文件**:
-   - 二进制 → `/usr/local/bin/v2ray`
-   - 数据(geoip/geosite)→ `/usr/local/share/v2ray/`
-   - 配置 → `/usr/local/etc/v2ray/config.json`
-   - 服务 → `/etc/systemd/system/v2ray.service`
-   - 日志 → `/var/log/v2ray/`
-5. **配置自检**:`v2ray version` + `v2ray test -config`。
-6. **防火墙(ufw)**:默认拒绝入站、放行出站,只放行 SSH 端口与 V2Ray 端口;若改了端口则移除旧的 22 放行规则。
-7. **创建登录用户**(必填用户名):自动建号 → **加入 sudo 组** → **生成 16 位随机密码并设置**(用于 sudo / 控制台,安装结束后打印一次)→ 从 `/root/.ssh/authorized_keys` 复制公钥到新用户(逐行去重、不破坏其原有 key)。若 root 无可用公钥则终止以防锁死。
-8. **SSH 加固**:校验新用户已有可用公钥(否则终止)→ 写入 `PasswordAuthentication no` / `PubkeyAuthentication yes` / `PermitRootLogin no` / 自定义 `Port` → `sshd -t` 校验通过后重启。**禁用 root 登录后,唯一入口是上一步创建的新用户。**
+   - 二进制 → `/usr/local/bin/xray`
+   - 数据(geoip/geosite)→ `/usr/local/share/xray/`
+   - 配置 → `/usr/local/etc/xray/config.json`
+   - 密钥备份 → `/usr/local/etc/xray/reality.keys`(私钥 + 公钥;公钥客户端要用)
+   - 服务 → `/etc/systemd/system/xray.service`
+   - 日志 → `/var/log/xray/`
+5. **生成配置**:随机 UUID、Reality x25519 密钥对、随机 shortId,写入 VLESS + Reality + Vision 配置。
+6. **配置自检**:`xray version` + 配置 test,不通过则不启动服务。
+7. **BBR**:写 `/etc/sysctl.d/99-bbr.conf` 开启 BBR + fq 并验证生效(不支持只告警)。
+8. **防火墙(ufw)**:默认拒绝入站、放行出站,只放行 SSH 端口与 Xray 端口;若改了端口则移除旧的 22 放行规则。
+9. **创建登录用户**(必填用户名):自动建号 → **加入 sudo 组** → **生成 16 位随机密码并设置**(用于 sudo / 控制台,安装结束后打印一次)→ 从 `/root/.ssh/authorized_keys` 复制公钥到新用户(逐行去重、不破坏其原有 key)。若 root 无可用公钥则终止以防锁死。
+10. **SSH 加固**:校验新用户已有可用公钥(否则终止)→ 写入 `PasswordAuthentication no` / `PubkeyAuthentication yes` / `PermitRootLogin no` / 自定义 `Port` → `sshd -t` 校验通过后重启。**禁用 root 登录后,唯一入口是上一步创建的新用户。**
 
 ---
 
@@ -125,10 +157,10 @@ bash install.sh uninstall
 
 脚本会一次性打印:
 
-- **V2Ray**:地址、端口、UUID、可直接导入 v2rayN/NG 等客户端的 `vmess://` 链接,以及一份完整的 Clash / Mihomo 配置
+- **节点信息**:地址、端口、UUID、SNI、公钥(pbk)、shortId、流控,以及可直接导入客户端的 `vless://` 链接,和一份完整的 Mihomo 配置
 - **服务器登录**:新用户名、随机密码(用于 sudo / 控制台)、SSH 端口
 
-> **Clash 用户怎么导入**:打印出来的是一份**完整 Clash 配置**。Clash 加订阅通常是填 URL,但本脚本不托管订阅、不传第三方,所以走「本地配置」:Clash Verge 里点「新建」→ 类型选 **Local(本地)** → 把整份粘进去 → 保存启用即可。已有 Clash 配置的话,只取其中 `proxies:` 那段加进去。
+> **Clash 用户怎么导入**:打印出来的是一份**完整 Mihomo 配置**(原版 Clash 不支持 Reality,需用 Clash Verge Rev 等 Mihomo 内核)。Clash 加订阅通常是填 URL,但本脚本不托管订阅、不传第三方,所以走「本地配置」:点「新建」→ 类型选 **Local(本地)** → 把整份粘进去 → 保存启用即可。已有配置的话,只取其中 `proxies:` 那段加进去。
 
 登录服务器(root 已禁用,只能用新用户 + 公钥):
 
@@ -136,15 +168,22 @@ bash install.sh uninstall
 ssh -p <SSH端口> <新用户名>@<服务器IP>
 ```
 
-V2Ray 管理命令:
+Xray 管理命令:
 
 ```bash
-systemctl status  v2ray
-systemctl restart v2ray
-systemctl stop    v2ray
+systemctl status  xray
+systemctl restart xray
+systemctl stop    xray
 ```
 
-> 想再次查看连接信息(`vmess://` 链接 + Clash 配置),在服务器上运行 `bash install.sh info`(只读,不改动配置)。
+> 想再次查看连接信息(`vless://` 链接 + Mihomo 配置),在服务器上运行 `bash install.sh info`(只读,不改动配置)。
+
+---
+
+## 从旧版(VMess)升级注意
+
+- 这是**换节点而非改参数**:UUID、端口、密钥全部重新生成,**旧的 VMess 客户端配置会全部失效**,需用新打印的 `vless://` 链接重新导入。
+- 若原服务器是因 IP 被封而迁移:换协议**不一定能救回已被整段封禁的 IP**。先确认是「端口被封」还是「整 IP 被封」(可用国内多地 TCP 探测,如对另一端口/443 做连通性测试),整 IP 被封时需更换 IP。
 
 ---
 
