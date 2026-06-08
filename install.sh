@@ -1,23 +1,33 @@
 #!/usr/bin/env bash
 #
-# v2ray-install — 纯净版 V2Ray 安装脚本 (Debian/Ubuntu, VMess + TCP)
+# xray-install — 纯净版 Xray 安装脚本 (Debian/Ubuntu, VLESS + Reality + Vision)
+#
+# 为什么用 VLESS + Reality:
+#   - 裸 VMess/VLESS over TCP 没有 TLS 伪装,流量特征明显,IP 跑一段时间就会被 GFW 封
+#   - Reality 借用一个真实大站的 TLS 握手来伪装,无需自己的域名/证书,能扛主动探测
+#   - 目前(2025-2026)国内抗封锁综合表现最好、维护成本最低的方案之一
 #
 # 与常见一键脚本的区别:
-#   - 二进制只从 v2fly 官方下载,并强制校验官方 SHA256,失败即终止
+#   - 二进制只从 XTLS 官方下载,并强制校验官方 SHA256,失败即终止
 #   - 全程走正常 TLS(不使用 --no-check-certificate)
-#   - 不关闭系统防火墙,只精确放行 V2Ray 用到的那一个端口
+#   - 不关闭系统防火墙,只精确放行用到的那一个端口
 #   - 不上传任何配置到第三方
+#
+# 客户端要求(必须支持 Reality + xtls-rprx-vision):
+#   v2rayN / NekoBox / sing-box / Shadowrocket / Clash.Meta(Mihomo)等较新版本均可
+#   注意:原版 Clash 不支持 VLESS/Reality,必须用 Mihomo 内核(Clash Verge Rev)
 #
 # 用法(推荐先下载再执行,便于审查内容、排查问题):
 #   curl -fsSL -o install.sh https://你的域名/install.sh
 #   bash install.sh             # 安装
-#   bash install.sh info        # 重新打印连接信息(vmess 链接 + Clash 配置),只读
+#   bash install.sh info        # 重新打印连接信息(vless 链接 + Clash 配置),只读
 #   bash install.sh uninstall   # 卸载
 #
 # 可选环境变量(非交互场景):
-#   V2RAY_PORT=12345   指定端口,缺省随机 (20000-65535)
-#                      (随机端口用 /dev/urandom 取值,覆盖整个区间)
-#   V2RAY_UUID=...     指定 UUID,缺省自动生成
+#   XRAY_PORT=443      指定端口,缺省 443 (Reality 伪装成 HTTPS,落在 443 最自然)
+#   XRAY_UUID=...      指定 UUID,缺省自动生成
+#   REALITY_SNI=...    指定伪装目标站(SNI),缺省 www.microsoft.com
+#                      要求:真实、支持 TLS1.3、且国内可正常访问的大站
 #   SSH_PORT=2222      指定新 SSH 端口,缺省保持 22
 #   SSH_USER=alice     【必填】要创建的登录用户名,会自动建号并从 root 复制公钥
 #                      (非交互模式必须提供;交互模式会提示输入)
@@ -29,12 +39,14 @@ msg()  { echo -e "${green}$*${none}"; }
 warn() { echo -e "${yellow}$*${none}"; }
 die()  { echo -e "\n${red}错误: $*${none}\n" >&2; exit 1; }
 
-V2RAY_BIN_DIR="/usr/local/bin"
-V2RAY_DATA_DIR="/usr/local/share/v2ray"
-V2RAY_CONFIG_DIR="/usr/local/etc/v2ray"
-V2RAY_CONFIG="${V2RAY_CONFIG_DIR}/config.json"
-V2RAY_SERVICE="/etc/systemd/system/v2ray.service"
-V2RAY_LOG_DIR="/var/log/v2ray"
+XRAY_BIN_DIR="/usr/local/bin"
+XRAY_BIN="${XRAY_BIN_DIR}/xray"
+XRAY_DATA_DIR="/usr/local/share/xray"
+XRAY_CONFIG_DIR="/usr/local/etc/xray"
+XRAY_CONFIG="${XRAY_CONFIG_DIR}/config.json"
+XRAY_KEYS="${XRAY_CONFIG_DIR}/reality.keys"   # 备份 Reality 公私钥(公钥客户端要用)
+XRAY_SERVICE="/etc/systemd/system/xray.service"
+XRAY_LOG_DIR="/var/log/xray"
 
 # 临时目录用全局 EXIT trap 统一清理。
 # 不要在函数内用 `trap ... RETURN`:set -u 下它会泄漏到外层函数(do_install)返回时
@@ -52,8 +64,8 @@ precheck() {
     command -v systemctl >/dev/null || die "本脚本依赖 systemd"
 
     case "$(uname -m)" in
-        x86_64|amd64)   V2RAY_ARCH="64" ;;
-        aarch64|arm64)  V2RAY_ARCH="arm64-v8a" ;;
+        x86_64|amd64)   XRAY_ARCH="64" ;;
+        aarch64|arm64)  XRAY_ARCH="arm64-v8a" ;;
         *) die "不支持的 CPU 架构: $(uname -m)" ;;
     esac
 }
@@ -69,8 +81,8 @@ install_deps() {
 # ---------------------------------------------------------------- 下载 + 校验
 
 download_and_verify() {
-    msg "[2/6] 查询 v2fly 官方最新版本..."
-    local api="https://api.github.com/repos/v2fly/v2ray-core/releases/latest"
+    msg "[2/6] 查询 XTLS/Xray-core 官方最新版本..."
+    local api="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
     local resp ver=""
     # 先把响应完整缓存到变量,避免 `curl | grep -m1` 中 grep 提前关管道
     # 导致 curl 报 "(23) Failure writing output to destination"
@@ -84,8 +96,8 @@ download_and_verify() {
     [[ -n "$ver" ]] || die "解析最新版本失败(GitHub API 可能限流,请稍后重试)"
     msg "    最新版本: ${cyan}${ver}${none}"
 
-    local base="https://github.com/v2fly/v2ray-core/releases/download/${ver}"
-    local zip_name="v2ray-linux-${V2RAY_ARCH}.zip"
+    local base="https://github.com/XTLS/Xray-core/releases/download/${ver}"
+    local zip_name="Xray-linux-${XRAY_ARCH}.zip"
     TMP_DIR="$(mktemp -d)"; local tmp="$TMP_DIR"   # 由顶部的 EXIT trap 统一清理
 
     msg "[3/6] 下载二进制及校验文件 (正常 TLS 校验)..."
@@ -109,59 +121,93 @@ download_and_verify() {
     msg "    校验通过: ${cyan}${actual}${none}"
 
     msg "[5/6] 安装文件到系统目录..."
-    mkdir -p "$V2RAY_DATA_DIR" "$V2RAY_CONFIG_DIR" "$V2RAY_LOG_DIR"
+    mkdir -p "$XRAY_DATA_DIR" "$XRAY_CONFIG_DIR" "$XRAY_LOG_DIR"
     unzip -o "${tmp}/${zip_name}" -d "${tmp}/unzip" >/dev/null
-    install -m 755 "${tmp}/unzip/v2ray" "${V2RAY_BIN_DIR}/v2ray"
+    install -m 755 "${tmp}/unzip/xray" "${XRAY_BIN}"
     # geoip / geosite 数据(路由用,可选)
-    if [[ -f "${tmp}/unzip/geoip.dat"   ]]; then install -m 644 "${tmp}/unzip/geoip.dat"   "${V2RAY_DATA_DIR}/"; fi
-    if [[ -f "${tmp}/unzip/geosite.dat" ]]; then install -m 644 "${tmp}/unzip/geosite.dat" "${V2RAY_DATA_DIR}/"; fi
+    if [[ -f "${tmp}/unzip/geoip.dat"   ]]; then install -m 644 "${tmp}/unzip/geoip.dat"   "${XRAY_DATA_DIR}/"; fi
+    if [[ -f "${tmp}/unzip/geosite.dat" ]]; then install -m 644 "${tmp}/unzip/geosite.dat" "${XRAY_DATA_DIR}/"; fi
 
-    V2RAY_VERSION="$ver"
+    XRAY_VERSION="$ver"
 }
 
-# ---------------------------------------------------------------- 生成配置
+# ---------------------------------------------------------------- 生成密钥/配置
 
-# 生成 20000-65535 的随机端口。
-# 注意:不能用 `RANDOM % 45535`,因为 $RANDOM 上限仅 32767,取模等于空操作,
-# 实际只会落在 20000-52767。这里用 /dev/urandom 取 16 位无符号数覆盖整个区间。
-rand_port() {
-    local n
-    n="$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')"   # 0-65535
-    echo $(( n % 45536 + 20000 ))                      # 20000-65535
+# 生成 Reality x25519 密钥对。需要已安装的 xray 二进制(在 download_and_verify 之后调用)。
+# 不同 Xray 版本输出标签略有差异(Private key/PrivateKey、Public key/Password),用正则兼容。
+gen_reality_keys() {
+    [[ -x "$XRAY_BIN" ]] || die "未找到可执行的 xray,无法生成 Reality 密钥"
+    local out
+    out="$("$XRAY_BIN" x25519 2>/dev/null)" || die "生成 Reality 密钥对失败 (xray x25519)"
+    PRIVATE_KEY=""; PUBLIC_KEY=""
+    # x25519 密钥是 43 位左右的 base64url,用 {40,} 把它和标签文字区分开
+    if [[ "$out" =~ [Pp]rivate[[:space:]_]?[Kk]ey:?[[:space:]]+([A-Za-z0-9_-]{40,}) ]]; then
+        PRIVATE_KEY="${BASH_REMATCH[1]}"
+    fi
+    if [[ "$out" =~ ([Pp]ublic[[:space:]_]?[Kk]ey|[Pp]assword):?[[:space:]]+([A-Za-z0-9_-]{40,}) ]]; then
+        PUBLIC_KEY="${BASH_REMATCH[2]}"
+    fi
+    [[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" ]] \
+        || die "解析 Reality 密钥失败,xray x25519 输出异常:
+${out}"
 }
 
 gen_config() {
-    msg "[6/6] 生成配置、服务与防火墙规则..."
+    msg "[6/6] 生成密钥、配置、服务与防火墙规则..."
 
-    UUID="${V2RAY_UUID:-$(cat /proc/sys/kernel/random/uuid)}"
-    if [[ -n "${V2RAY_PORT:-}" ]]; then
-        PORT="$V2RAY_PORT"
+    UUID="${XRAY_UUID:-$(cat /proc/sys/kernel/random/uuid)}"
+
+    # 端口:默认 443(Reality 伪装成 HTTPS,落在 443 最自然、最不打眼)
+    if [[ -n "${XRAY_PORT:-}" ]]; then
+        PORT="$XRAY_PORT"
     elif [[ -t 0 ]]; then
-        local rnd; rnd="$(rand_port)"
-        read -rp "$(echo -e "请输入 V2Ray 端口 [回车随机 ${cyan}${rnd}${none}]: ")" PORT
-        PORT="${PORT:-$rnd}"
+        read -rp "$(echo -e "请输入 Xray 端口 [回车默认 ${cyan}443${none}]: ")" PORT
+        PORT="${PORT:-443}"
     else
-        PORT="$(rand_port)"
+        PORT=443
     fi
     [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) || die "端口非法: $PORT"
 
-    cat > "$V2RAY_CONFIG" <<EOF
+    # 伪装目标站(SNI):客户端用它做 SNI,服务端用它的 :443 中转真实 TLS 握手
+    SNI="${REALITY_SNI:-www.microsoft.com}"
+    [[ "$SNI" =~ ^[A-Za-z0-9.-]+$ ]] || die "SNI 非法: $SNI"
+
+    # 生成 Reality 密钥对(需要已安装的 xray 二进制)
+    gen_reality_keys
+
+    # shortId:8 字节随机 hex(客户端需带相同值;不放空串,等于强制校验)
+    SHORT_ID="$(openssl rand -hex 8)"
+    [[ "$SHORT_ID" =~ ^[0-9a-f]{16}$ ]] || die "生成 shortId 失败,请确认 openssl 可用"
+
+    cat > "$XRAY_CONFIG" <<EOF
 {
   "log": {
     "loglevel": "warning",
-    "access": "${V2RAY_LOG_DIR}/access.log",
-    "error": "${V2RAY_LOG_DIR}/error.log"
+    "access": "${XRAY_LOG_DIR}/access.log",
+    "error": "${XRAY_LOG_DIR}/error.log"
   },
   "inbounds": [
     {
       "port": ${PORT},
-      "protocol": "vmess",
+      "protocol": "vless",
       "settings": {
         "clients": [
-          { "id": "${UUID}", "alterId": 0 }
-        ]
+          { "id": "${UUID}", "flow": "xtls-rprx-vision" }
+        ],
+        "decryption": "none"
       },
-      "streamSettings": { "network": "tcp" }
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "${SNI}:443",
+          "xver": 0,
+          "serverNames": ["${SNI}"],
+          "privateKey": "${PRIVATE_KEY}",
+          "shortIds": ["${SHORT_ID}"]
+        }
+      }
     }
   ],
   "outbounds": [
@@ -169,42 +215,56 @@ gen_config() {
   ]
 }
 EOF
+
+    # config.json 里只有私钥;公钥客户端连接时要用(pbk),另存一份便于 info 重打印 / 备份
+    cat > "$XRAY_KEYS" <<EOF
+PrivateKey: ${PRIVATE_KEY}
+PublicKey: ${PUBLIC_KEY}
+EOF
+    chmod 600 "$XRAY_KEYS"
 }
 
 # 启动前自检:校验二进制可执行 + 配置文件合法
 verify_config() {
     msg "    自检: 校验二进制与配置..."
     local ver_out
-    # 不用 `... | head -1`:v2ray version 逐行输出,head 读完首行就关管道,
-    # set -o pipefail 下 v2ray 写后续行会收到 SIGPIPE(退出 141),被误判为"二进制无法执行"。
+    # 不用 `... | head -1`:xray version 逐行输出,head 读完首行就关管道,
+    # set -o pipefail 下 xray 写后续行会收到 SIGPIPE(退出 141),被误判为"二进制无法执行"。
     # 先整体捕获(无管道),再用 bash 参数展开取首行。
-    ver_out="$("${V2RAY_BIN_DIR}/v2ray" version 2>/dev/null)" \
+    ver_out="$("$XRAY_BIN" version 2>/dev/null)" \
         || die "二进制无法执行,安装可能损坏"
     ver_out="${ver_out%%$'\n'*}"
     msg "    二进制: ${cyan}${ver_out}${none}"
 
-    # v5: `v2ray test -config`  /  v4: `v2ray -test -config`
-    if ! V2RAY_LOCATION_ASSET="$V2RAY_DATA_DIR" "${V2RAY_BIN_DIR}/v2ray" test -config "$V2RAY_CONFIG" >/dev/null 2>&1 \
-       && ! V2RAY_LOCATION_ASSET="$V2RAY_DATA_DIR" "${V2RAY_BIN_DIR}/v2ray" -test -config "$V2RAY_CONFIG" >/dev/null 2>&1; then
+    if ! _xray_test_config; then
         echo -e "${red}    配置校验输出:${none}" >&2
-        V2RAY_LOCATION_ASSET="$V2RAY_DATA_DIR" "${V2RAY_BIN_DIR}/v2ray" test -config "$V2RAY_CONFIG" >&2 2>&1 || true
-        die "配置文件未通过 V2Ray 自检,已终止(未启动服务)"
+        XRAY_LOCATION_ASSET="$XRAY_DATA_DIR" "$XRAY_BIN" run -test -c "$XRAY_CONFIG" >&2 2>&1 || true
+        die "配置文件未通过 Xray 自检,已终止(未启动服务)"
     fi
     msg "    配置合法 ✓"
 }
 
+# 仅做配置校验(不启动服务)。不同 Xray 版本的 test 子命令/旗标写法不同,逐个尝试。
+# 这几种写法都带 test 语义,即使旗标不支持也只会快速报错退出,不会真的把服务跑起来挂住。
+_xray_test_config() {
+    XRAY_LOCATION_ASSET="$XRAY_DATA_DIR" "$XRAY_BIN" run -test -c "$XRAY_CONFIG"  >/dev/null 2>&1 && return 0
+    XRAY_LOCATION_ASSET="$XRAY_DATA_DIR" "$XRAY_BIN" test -c "$XRAY_CONFIG"       >/dev/null 2>&1 && return 0
+    XRAY_LOCATION_ASSET="$XRAY_DATA_DIR" "$XRAY_BIN" -test -config "$XRAY_CONFIG" >/dev/null 2>&1 && return 0
+    return 1
+}
+
 install_service() {
-    cat > "$V2RAY_SERVICE" <<EOF
+    cat > "$XRAY_SERVICE" <<EOF
 [Unit]
-Description=V2Ray Service
-Documentation=https://www.v2fly.org/
+Description=Xray Service
+Documentation=https://github.com/XTLS/Xray-core
 After=network.target nss-lookup.target
 
 [Service]
 Type=simple
 User=root
-Environment=V2RAY_LOCATION_ASSET=${V2RAY_DATA_DIR}
-ExecStart=${V2RAY_BIN_DIR}/v2ray run -config ${V2RAY_CONFIG}
+Environment=XRAY_LOCATION_ASSET=${XRAY_DATA_DIR}
+ExecStart=${XRAY_BIN} run -c ${XRAY_CONFIG}
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=1048576
@@ -213,8 +273,8 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable v2ray >/dev/null 2>&1
-    systemctl restart v2ray
+    systemctl enable xray >/dev/null 2>&1
+    systemctl restart xray
 }
 
 # ---------------------------------------------------------------- BBR 加速
@@ -257,15 +317,15 @@ prompt_ssh_port() {
     [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && (( SSH_PORT >= 1 && SSH_PORT <= 65535 )) \
         || die "SSH 端口非法: $SSH_PORT"
     # 用 if 而非 `[[ ]] && die`:后者作为函数最后一行,正常情况(端口不等)会返回 1,
-    # 触发外层 do_install 的 set -e 静默退出(脚本会停在这里,v2ray 已起但不再继续)。
+    # 触发外层 do_install 的 set -e 静默退出(脚本会停在这里,xray 已起但不再继续)。
     if [[ "$SSH_PORT" == "$PORT" ]]; then
-        die "SSH 端口不能与 V2Ray 端口 ($PORT) 相同"
+        die "SSH 端口不能与 Xray 端口 ($PORT) 相同"
     fi
 }
 
-# 配置 ufw:默认拒绝入站、放行出站,只开放 SSH 与 V2Ray 端口
+# 配置 ufw:默认拒绝入站、放行出站,只开放 SSH 与 Xray 端口
 setup_ufw() {
-    msg "[防火墙] 配置 ufw (默认拒绝入站,仅放行 SSH ${SSH_PORT}/tcp 与 V2Ray ${PORT}/tcp)..."
+    msg "[防火墙] 配置 ufw (默认拒绝入站,仅放行 SSH ${SSH_PORT}/tcp 与 Xray ${PORT}/tcp)..."
     ufw default deny incoming  >/dev/null
     ufw default allow outgoing >/dev/null
     # 先放行 SSH 新端口再启用,避免把自己关在门外
@@ -363,7 +423,7 @@ harden_ssh() {
 
     local sshd_main="/etc/ssh/sshd_config"
     local dropin_dir="/etc/ssh/sshd_config.d"
-    local conf_block="# Managed by v2ray-install — 请勿手动编辑
+    local conf_block="# Managed by xray-install — 请勿手动编辑
 Port ${SSH_PORT}
 PasswordAuthentication no
 PubkeyAuthentication yes
@@ -375,7 +435,7 @@ UsePAM yes"
 
     # 优先用 drop-in:命名 00- 使其先于 cloud-init 的 50- 生效(sshd 取首个匹配值)
     if [[ -d "$dropin_dir" ]] && grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$sshd_main"; then
-        local dropin="${dropin_dir}/00-v2ray-hardening.conf"
+        local dropin="${dropin_dir}/00-xray-hardening.conf"
         printf '%s\n' "$conf_block" > "$dropin"
         if ! sshd -t 2>/dev/null; then
             rm -f "$dropin"
@@ -420,28 +480,30 @@ get_ip() {
     echo "$ip"
 }
 
-# 渲染节点连接信息:VMess 头部 + vmess:// 链接 + Clash YAML。
-# 安装结束(print_result)与 `info` 子命令共用,依赖全局 PORT / UUID / V2RAY_VERSION。
+# 渲染节点连接信息:VLESS 参数 + vless:// 链接 + Clash(Mihomo)YAML。
+# 安装结束(print_result)与 `info` 子命令共用,依赖全局
+# PORT / UUID / SNI / PUBLIC_KEY / SHORT_ID / XRAY_VERSION。
 print_node_info() {
     local ip; ip="$(get_ip)"
-    local vmess_json
-    vmess_json="$(cat <<EOF
-{"v":"2","ps":"v2ray-${ip}","add":"${ip}","port":"${PORT}","id":"${UUID}","aid":"0","net":"tcp","type":"none","host":"","path":"","tls":""}
-EOF
-)"
-    local link="vmess://$(echo -n "$vmess_json" | base64 -w 0)"
+    local name="Reality-${ip}"
+    # vless://UUID@IP:PORT?参数#备注  —— 主流客户端可直接扫码/粘贴导入
+    local link="vless://${UUID}@${ip}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&spx=%2F&type=tcp#${name}"
 
-    echo -e "  版本     : ${cyan}${V2RAY_VERSION}${none}"
+    echo -e "  版本     : ${cyan}${XRAY_VERSION}${none}"
     echo -e "  地址     : ${cyan}${ip}${none}"
     echo -e "  端口     : ${cyan}${PORT}${none}"
     echo -e "  UUID     : ${cyan}${UUID}${none}"
-    echo -e "  alterId  : ${cyan}0${none}"
-    echo -e "  传输     : ${cyan}VMess + TCP${none}"
+    echo -e "  传输     : ${cyan}VLESS + Reality (TCP)${none}"
+    echo -e "  流控flow : ${cyan}xtls-rprx-vision${none}"
+    echo -e "  SNI/伪装 : ${cyan}${SNI}${none}"
+    echo -e "  公钥 pbk : ${cyan}${PUBLIC_KEY}${none}"
+    echo -e "  shortId  : ${cyan}${SHORT_ID}${none}"
+    echo -e "  指纹 fp  : ${cyan}chrome${none}"
     echo
     echo -e "  导入链接 : ${green}${link}${none}"
     echo
-    echo -e "  ${cyan}Clash / Mihomo${none}(vmess:// 链接 Clash 系不识别,用下面这份完整配置):"
-    echo -e "  ${yellow}Clash Verge:新建配置 → 类型选「Local / 本地」→ 粘贴整份 → 保存启用${none}"
+    echo -e "  ${cyan}Clash.Meta / Mihomo${none}(原版 Clash 不支持 VLESS/Reality,必须用 Mihomo 内核):"
+    echo -e "  ${yellow}Clash Verge Rev:新建配置 → 类型选「Local / 本地」→ 粘贴整份 → 保存启用${none}"
     echo -e "  ${yellow}已有 Clash 配置:只取下面 proxies: 那一段,加进你现有配置即可${none}"
     echo
     # 故意顶格输出(不跟随上面的缩进框):Clash 配置的顶层键必须在 YAML 第 0 列,
@@ -454,20 +516,25 @@ allow-lan: false
 mode: rule
 log-level: info
 proxies:
-  - name: "v2ray-${ip}"
-    type: vmess
+  - name: "${name}"
+    type: vless
     server: ${ip}
     port: ${PORT}
     uuid: ${UUID}
-    alterId: 0
-    cipher: auto
     network: tcp
     udp: true
+    tls: true
+    flow: xtls-rprx-vision
+    servername: ${SNI}
+    reality-opts:
+      public-key: ${PUBLIC_KEY}
+      short-id: ${SHORT_ID}
+    client-fingerprint: chrome
 proxy-groups:
   - name: PROXY
     type: select
     proxies:
-      - "v2ray-${ip}"
+      - "${name}"
       - DIRECT
 rules:
   - GEOIP,CN,DIRECT
@@ -480,8 +547,9 @@ print_result() {
     echo "================= 安装完成 ================="
     print_node_info
     echo
-    echo "  管理命令 : systemctl {status|restart|stop} v2ray"
-    echo "  配置文件 : ${V2RAY_CONFIG}"
+    echo "  管理命令 : systemctl {status|restart|stop} xray"
+    echo "  配置文件 : ${XRAY_CONFIG}"
+    echo "  密钥备份 : ${XRAY_KEYS}"
     echo "--------------------------------------------"
     echo -e "  SSH 端口 : ${cyan}${SSH_PORT}${none}"
     echo -e "  登录用户 : ${cyan}${SSH_USER}${none} (已复制 root 公钥, 已加 sudo)"
@@ -503,31 +571,47 @@ print_result() {
 
 # ---------------------------------------------------------------- info 子命令
 
-# `info` 子命令:从已安装的 config.json 读取端口 / UUID,重新打印节点连接信息
-# (vmess:// 链接 + Clash YAML)。纯只读,不改动任何配置或服务。
+# `info` 子命令:从已安装的 config.json + reality.keys 读取参数,重新打印节点连接信息
+# (vless:// 链接 + Clash YAML)。纯只读,不改动任何配置或服务。
 # 用途:之前装过、想再次拿到连接信息时,无需(也不应)重跑安装——重装会生成
-# 新的 UUID/端口,等于换了节点,现有客户端全部失效。
+# 新的 UUID/端口/密钥,等于换了节点,现有客户端全部失效。
 show_info() {
-    [[ -f "$V2RAY_CONFIG" ]] || die "未找到 ${V2RAY_CONFIG},请确认已用本脚本安装过 V2Ray"
-    [[ -r "$V2RAY_CONFIG" ]] || die "无权读取 ${V2RAY_CONFIG},请用 root 运行: sudo bash $0 info"
+    [[ -f "$XRAY_CONFIG" ]] || die "未找到 ${XRAY_CONFIG},请确认已用本脚本安装过 Xray"
+    [[ -r "$XRAY_CONFIG" ]] || die "无权读取 ${XRAY_CONFIG},请用 root 运行: sudo bash $0 info"
 
-    # 解析端口与 UUID:沿用脚本一贯的「整体捕获 + 参数展开」写法,不经管道,
-    # 避免 grep | head 在 set -o pipefail 下因 SIGPIPE 误伤(理由同 verify_config)。
-    local praw uraw
-    praw="$(grep -oE '"port"[[:space:]]*:[[:space:]]*[0-9]+' "$V2RAY_CONFIG" || true)"
-    praw="${praw%%$'\n'*}"            # 仅取第一行,形如 '"port": 31535'
-    PORT="${praw##*[!0-9]}"           # 删掉末尾连续数字之前的全部字符 → 纯端口号
-    uraw="$(grep -oiE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' "$V2RAY_CONFIG" || true)"
-    UUID="${uraw%%$'\n'*}"
-    [[ -n "$PORT" && -n "$UUID" ]] || die "无法从 ${V2RAY_CONFIG} 解析端口/UUID(配置可能被手动改过)"
+    # 解析:沿用脚本一贯的「整体捕获 + bash 正则」写法,不经 grep|head 管道,
+    # 避免在 set -o pipefail 下因 SIGPIPE 误伤(理由同 verify_config)。
+    local content; content="$(cat "$XRAY_CONFIG")"
+    PORT=""; UUID=""; SNI=""; SHORT_ID=""
+    if [[ "$content" =~ \"port\"[[:space:]]*:[[:space:]]*([0-9]+) ]]; then PORT="${BASH_REMATCH[1]}"; fi
+    if [[ "$content" =~ ([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}) ]]; then UUID="${BASH_REMATCH[1]}"; fi
+    if [[ "$content" =~ \"serverNames\"[[:space:]]*:[[:space:]]*\[[[:space:]]*\"([^\"]+)\" ]]; then SNI="${BASH_REMATCH[1]}"; fi
+    if [[ "$content" =~ \"shortIds\"[[:space:]]*:[[:space:]]*\[[[:space:]]*\"([^\"]*)\" ]]; then SHORT_ID="${BASH_REMATCH[1]}"; fi
+    [[ -n "$PORT" && -n "$UUID" && -n "$SNI" ]] || die "无法从 ${XRAY_CONFIG} 解析端口/UUID/SNI(配置可能被手动改过)"
+
+    # 公钥:优先读备份文件,其次用 config 里的私钥反推(老/新版 xray 旗标可能不同,失败则标未知)
+    PUBLIC_KEY=""
+    if [[ -f "$XRAY_KEYS" ]]; then
+        local kc; kc="$(cat "$XRAY_KEYS")"
+        if [[ "$kc" =~ [Pp]ublic[Kk]ey:[[:space:]]*([A-Za-z0-9_-]+) ]]; then PUBLIC_KEY="${BASH_REMATCH[1]}"; fi
+    fi
+    if [[ -z "$PUBLIC_KEY" ]]; then
+        local priv=""
+        if [[ "$content" =~ \"privateKey\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9_-]+)\" ]]; then priv="${BASH_REMATCH[1]}"; fi
+        if [[ -n "$priv" && -x "$XRAY_BIN" ]]; then
+            local d; d="$("$XRAY_BIN" x25519 -i "$priv" 2>/dev/null || true)"
+            if [[ "$d" =~ ([Pp]ublic[[:space:]_]?[Kk]ey|[Pp]assword):?[[:space:]]+([A-Za-z0-9_-]{40,}) ]]; then PUBLIC_KEY="${BASH_REMATCH[2]}"; fi
+        fi
+    fi
+    [[ -n "$PUBLIC_KEY" ]] || PUBLIC_KEY="(未知,请查看 ${XRAY_KEYS})"
 
     # 版本:整体捕获二进制输出取首行(不用 head,理由同 verify_config);取不到则标「未知」
     local vraw=""
-    if [[ -x "${V2RAY_BIN_DIR}/v2ray" ]]; then
-        vraw="$("${V2RAY_BIN_DIR}/v2ray" version 2>/dev/null || true)"
+    if [[ -x "$XRAY_BIN" ]]; then
+        vraw="$("$XRAY_BIN" version 2>/dev/null || true)"
     fi
-    V2RAY_VERSION="${vraw%%$'\n'*}"
-    V2RAY_VERSION="${V2RAY_VERSION:-未知}"
+    XRAY_VERSION="${vraw%%$'\n'*}"
+    XRAY_VERSION="${XRAY_VERSION:-未知}"
 
     echo
     echo "================ 节点连接信息 ================"
@@ -540,12 +624,12 @@ show_info() {
 
 uninstall() {
     precheck
-    warn "正在卸载 V2Ray..."
-    systemctl disable --now v2ray >/dev/null 2>&1 || true
-    rm -f "$V2RAY_SERVICE"
+    warn "正在卸载 Xray..."
+    systemctl disable --now xray >/dev/null 2>&1 || true
+    rm -f "$XRAY_SERVICE"
     systemctl daemon-reload
-    rm -f "${V2RAY_BIN_DIR}/v2ray"
-    rm -rf "$V2RAY_DATA_DIR" "$V2RAY_CONFIG_DIR" "$V2RAY_LOG_DIR"
+    rm -f "${XRAY_BIN}"
+    rm -rf "$XRAY_DATA_DIR" "$XRAY_CONFIG_DIR" "$XRAY_LOG_DIR"
     msg "卸载完成。"
     warn "注意: 之前放行的防火墙端口规则未自动移除,如需清理请手动操作。"
 }
@@ -567,7 +651,7 @@ do_install() {
     setup_ufw
     harden_ssh
     sleep 1
-    systemctl is-active --quiet v2ray || die "V2Ray 启动失败,请运行: journalctl -u v2ray -n 50"
+    systemctl is-active --quiet xray || die "Xray 启动失败,请运行: journalctl -u xray -n 50"
     print_result
 }
 
