@@ -20,6 +20,23 @@
 
 ---
 
+## 两种模式:直连 Reality(默认)/ 套 Cloudflare CDN
+
+脚本支持两种安装模式:
+
+| | `reality`(默认) | `cdn` |
+|---|---|---|
+| 协议 | VLESS + Reality + Vision(直连) | VLESS + WS + TLS(经 Cloudflare) |
+| 需要域名 | 否 | **是**(需已托管在 Cloudflare) |
+| 暴露源站 IP | 是(客户端直连你的 VPS) | **否**(GFW 只看到 Cloudflare 的 IP) |
+| 适合 | IP 干净、追求低延迟 | **IP 已被降权 / 限速,又不想换 IP** |
+
+**什么时候上 CDN 模式**:Reality 抗识别很强,但藏不住「你在往一个固定境外 IP 持续灌大流量」这件事——当 IP 被 GFW 按行为 / 信誉**降权限速**时(典型表现:时好时坏、SSH 正常但代理抽风、流量也没超),换协议救不了,换 IP 最直接。如果**不想换 IP**,就用 CDN 模式把源站 IP 藏到 Cloudflare 后面,GFW 只看得到 CF 的 IP。
+
+> **CDN 模式的取舍**:它换来的是**可用性 / 抗封**(CF 的 IP 池极大,几乎封不死),但**不保证更快**——Cloudflare 免费版回国线路质量飘忽,高峰可能比直连还慢。可在客户端用 **Cloudflare 优选 IP** 改善。
+
+---
+
 ## 特性
 
 - **二进制只从 [XTLS/Xray-core 官方仓库](https://github.com/XTLS/Xray-core/releases) 下载**,并**强制校验官方 SHA256**,校验不通过立即终止。
@@ -68,6 +85,24 @@ SSH_PORT=2222 SSH_USER=你的登录用户名 bash install.sh
 > 端口缺省即 443(Reality 伪装成 HTTPS,落在 443 最自然);如需指定可加 `XRAY_PORT=...`。
 > 伪装站缺省 `www.microsoft.com`,如需更换可加 `REALITY_SNI=...`(要求:真实、支持 TLS1.3、国内可正常访问的大站)。
 
+### 安装(CDN 模式:套 Cloudflare,隐藏源站 IP)
+
+前提:你有一个**已经把 DNS 托管到 Cloudflare** 的域名。
+
+```bash
+curl -fsSL -o install.sh https://raw.githubusercontent.com/Llane00/v2ray-install/main/install.sh
+CDN_DOMAIN=cdn.你的域名 SSH_USER=你的登录用户名 bash install.sh cdn
+```
+
+装完后,**必须再去 Cloudflare 后台做两步**(脚本结束时也会打印):
+
+1. **DNS** 加一条 A 记录:`cdn.你的域名` → 你的 VPS IP,**橙色云(Proxied)开启**。
+2. **SSL/TLS → 概览**,加密模式设为 **Full**(不是 Flexible,也不是 Full strict)。
+
+设完等几分钟,让 Cloudflare 的边缘证书变 Active,再用客户端连。源站用**自签证书**(CF「Full」模式不校验它),所以脚本零额外依赖、不需要 CF API token。
+
+> CDN 模式客户端走 **VLESS + WS + TLS**(不需要 Reality / Vision),兼容的客户端更多;但 Clash 仍需 Mihomo 内核(Clash Verge Rev)。
+
 ### 重新获取连接信息(已经装过的机器)
 
 想再次拿到 `vless://` 链接或 Clash 配置时,**不要重跑安装**——重装会生成新的 UUID / 端口 / 密钥,等于换了节点,现有客户端会全部失效。直接在服务器上执行:
@@ -102,7 +137,9 @@ bash install.sh uninstall
 | `SSH_PORT`    | 新的 SSH 端口 | 保持 `22` |
 | `XRAY_PORT`   | Xray 监听端口 | `443` |
 | `XRAY_UUID`   | VLESS UUID | 自动生成 |
-| `REALITY_SNI` | Reality 伪装目标站(同时用作 SNI 与中转 dest) | `www.microsoft.com` |
+| `REALITY_SNI` | [reality] Reality 伪装目标站(同时用作 SNI 与中转 dest) | `www.microsoft.com` |
+| `MODE`        | 安装模式:`reality`(默认)或 `cdn`(套 Cloudflare) | `reality` |
+| `CDN_DOMAIN`  | **【cdn 模式必填】** 已托管在 Cloudflare 的域名/子域(如 `cdn.example.com`) | 交互模式会提示输入 |
 
 > 用户名规则:`^[a-z_][a-z0-9_-]*$`(小写字母/数字/下划线/连字符,**不能以数字开头**)。例如 `llane`、`user1` 可以,`123` 不行。
 

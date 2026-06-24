@@ -19,15 +19,23 @@
 #
 # 用法(推荐先下载再执行,便于审查内容、排查问题):
 #   curl -fsSL -o install.sh https://你的域名/install.sh
-#   bash install.sh             # 安装
+#   bash install.sh             # 安装(默认 Reality 直连)
+#   bash install.sh cdn         # 安装 CDN 模式 (VLESS+WS+TLS over Cloudflare, 需已托管在 CF 的域名)
 #   bash install.sh info        # 重新打印连接信息(vless 链接 + Clash 配置),只读
 #   bash install.sh uninstall   # 卸载
+#
+# 两种模式怎么选:
+#   reality(默认)— 直连 + Reality 伪装,无需域名;适合 IP 干净、追求低延迟
+#   cdn           — 套 Cloudflare,把源站 IP 藏到 CF 后面;适合 IP 已被降权/限速、
+#                   换 IP 也不想换时(GFW 只看到 Cloudflare 的 IP)。需要一个托管在 CF 的域名。
 #
 # 可选环境变量(非交互场景):
 #   XRAY_PORT=443      指定端口,缺省 443 (Reality 伪装成 HTTPS,落在 443 最自然)
 #   XRAY_UUID=...      指定 UUID,缺省自动生成
-#   REALITY_SNI=...    指定伪装目标站(SNI),缺省 www.microsoft.com
+#   REALITY_SNI=...    [reality] 指定伪装目标站(SNI),缺省 www.microsoft.com
 #                      要求:真实、支持 TLS1.3、且国内可正常访问的大站
+#   MODE=cdn           安装模式改为 CDN(套 Cloudflare);缺省 reality
+#   CDN_DOMAIN=...     [cdn 必填] 已托管在 Cloudflare 的域名/子域(如 cdn.example.com)
 #   SSH_PORT=2222      指定新 SSH 端口,缺省保持 22
 #   SSH_USER=alice     【必填】要创建的登录用户名,会自动建号并从 root 复制公钥
 #                      (非交互模式必须提供;交互模式会提示输入)
@@ -45,8 +53,13 @@ XRAY_DATA_DIR="/usr/local/share/xray"
 XRAY_CONFIG_DIR="/usr/local/etc/xray"
 XRAY_CONFIG="${XRAY_CONFIG_DIR}/config.json"
 XRAY_KEYS="${XRAY_CONFIG_DIR}/reality.keys"   # 备份 Reality 公私钥(公钥客户端要用)
+XRAY_CERT_DIR="${XRAY_CONFIG_DIR}/self-cert"  # CDN 模式自签证书目录(cert.pem/key.pem)
 XRAY_SERVICE="/etc/systemd/system/xray.service"
 XRAY_LOG_DIR="/var/log/xray"
+
+# 安装模式:reality(默认,直连 + Reality 伪装)| cdn(套 Cloudflare,VLESS+WS+TLS)。
+# 影响 gen_config / print_node_info 的分派;info / uninstall 会从已装配置自动识别,无需指定。
+MODE="${MODE:-reality}"
 
 # 临时目录用全局 EXIT trap 统一清理。
 # 不要在函数内用 `trap ... RETURN`:set -u 下它会泄漏到外层函数(do_install)返回时
@@ -164,8 +177,17 @@ gen_reality_keys() {
 ${out}"
 }
 
+# 生成配置:按 MODE 分派(reality 直连伪装 / cdn 套 Cloudflare WS+TLS)
 gen_config() {
-    msg "[6/6] 生成密钥、配置、服务与防火墙规则..."
+    case "$MODE" in
+        reality) gen_config_reality ;;
+        cdn)     gen_config_cdn ;;
+        *) die "未知 MODE: $MODE" ;;
+    esac
+}
+
+gen_config_reality() {
+    msg "[6/6] 生成密钥、配置、服务与防火墙规则 (Reality)..."
 
     UUID="${XRAY_UUID:-$(cat /proc/sys/kernel/random/uuid)}"
 
@@ -234,6 +256,96 @@ PrivateKey: ${PRIVATE_KEY}
 PublicKey: ${PUBLIC_KEY}
 EOF
     chmod 600 "$XRAY_KEYS"
+}
+
+# CDN 模式:VLESS + WebSocket + TLS,套在 Cloudflare 后面。
+# 客户端连「域名」(解析到 CF)→ CF 回源到本机 443 → Xray 处理 WS+TLS。
+# 源站用自签证书,Cloudflare SSL/TLS 模式需设为「Full」(CF 不校验源站证书)。
+gen_config_cdn() {
+    msg "[6/6] 生成证书、配置、服务与防火墙规则 (CDN: VLESS+WS+TLS)..."
+
+    UUID="${XRAY_UUID:-$(cat /proc/sys/kernel/random/uuid)}"
+
+    # 端口:Cloudflare 免费版回源走 443(HTTPS),所以源站固定监听 443
+    if [[ -n "${XRAY_PORT:-}" ]]; then
+        PORT="$XRAY_PORT"
+        [[ "$PORT" == 443 ]] || warn "    注意:你指定了非 443 端口 ($PORT);Cloudflare 免费版回源默认走 443,非 443 需额外配 Origin Rules,否则连不上"
+    else
+        PORT=443
+    fi
+    [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) || die "端口非法: $PORT"
+
+    # 域名(必填):客户端连它(它解析到 Cloudflare),CF 再回源到本机
+    if [[ -z "${CDN_DOMAIN:-}" ]]; then
+        if [[ -t 0 ]]; then
+            while [[ -z "${CDN_DOMAIN:-}" ]]; do
+                read -rp "$(echo -e "请输入已托管在 Cloudflare 的域名/子域 (如 ${cyan}cdn.example.com${none}, ${red}必填${none}): ")" CDN_DOMAIN
+            done
+        else
+            die "CDN 模式必须通过 CDN_DOMAIN=<你的域名> 指定(需已托管在 Cloudflare)"
+        fi
+    fi
+    [[ "$CDN_DOMAIN" =~ ^[A-Za-z0-9.-]+$ && "$CDN_DOMAIN" == *.* ]] || die "域名非法: $CDN_DOMAIN"
+
+    # WS 路径:随机密钥路径(客户端要带相同值;等于一道弱口令,挡掉无脑扫描)
+    WS_PATH="/$(openssl rand -hex 8)"
+
+    # 自签证书(仅 CF↔源站这段加密;CF 设 Full 模式不校验它)
+    gen_self_signed_cert
+
+    cat > "$XRAY_CONFIG" <<EOF
+{
+  "log": {
+    "loglevel": "warning",
+    "access": "${XRAY_LOG_DIR}/access.log",
+    "error": "${XRAY_LOG_DIR}/error.log"
+  },
+  "inbounds": [
+    {
+      "port": ${PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          { "id": "${UUID}" }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "${CDN_DOMAIN}",
+          "alpn": ["http/1.1"],
+          "certificates": [
+            {
+              "certificateFile": "${XRAY_CERT_DIR}/cert.pem",
+              "keyFile": "${XRAY_CERT_DIR}/key.pem"
+            }
+          ]
+        },
+        "wsSettings": {
+          "path": "${WS_PATH}"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    { "protocol": "freedom", "tag": "direct" }
+  ]
+}
+EOF
+}
+
+# 生成自签 TLS 证书到 XRAY_CERT_DIR(EC P-256,CN=域名,10 年有效)。
+# 仅用于 Cloudflare「Full」模式下 CF↔源站的加密——CF 不校验该证书,故无需受信任 CA。
+gen_self_signed_cert() {
+    mkdir -p "$XRAY_CERT_DIR"
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+        -keyout "${XRAY_CERT_DIR}/key.pem" -out "${XRAY_CERT_DIR}/cert.pem" \
+        -days 3650 -nodes -subj "/CN=${CDN_DOMAIN}" >/dev/null 2>&1 \
+        || die "生成自签证书失败,请确认 openssl 可用"
+    chmod 600 "${XRAY_CERT_DIR}/key.pem"
+    chmod 644 "${XRAY_CERT_DIR}/cert.pem"
 }
 
 # 启动前自检:校验二进制可执行 + 配置文件合法
@@ -492,10 +604,17 @@ get_ip() {
     echo "$ip"
 }
 
-# 渲染节点连接信息:VLESS 参数 + vless:// 链接 + Clash(Mihomo)YAML。
-# 安装结束(print_result)与 `info` 子命令共用,依赖全局
-# PORT / UUID / SNI / PUBLIC_KEY / SHORT_ID / XRAY_VERSION。
+# 渲染节点连接信息:按 MODE 分派。安装结束(print_result)与 `info` 子命令共用。
 print_node_info() {
+    case "$MODE" in
+        reality) print_node_info_reality ;;
+        cdn)     print_node_info_cdn ;;
+    esac
+}
+
+# Reality 直连:VLESS 参数 + vless:// 链接 + Clash(Mihomo)YAML。
+# 依赖全局 PORT / UUID / SNI / PUBLIC_KEY / SHORT_ID / XRAY_VERSION。
+print_node_info_reality() {
     local ip; ip="$(get_ip)"
     local name="Reality-${ip}"
     # vless://UUID@IP:PORT?参数#备注  —— 主流客户端可直接扫码/粘贴导入
@@ -554,6 +673,66 @@ rules:
 EOF
 }
 
+# CDN 套 Cloudflare:VLESS + WS + TLS。客户端连「域名」(经 Cloudflare 回源),
+# 依赖全局 PORT / UUID / CDN_DOMAIN / WS_PATH / XRAY_VERSION。
+print_node_info_cdn() {
+    local ip; ip="$(get_ip)"
+    local name="CDN-${CDN_DOMAIN}"
+    local path_enc="%2F${WS_PATH#/}"   # 分享链接里路径的前导 / 需 url 编码
+    local link="vless://${UUID}@${CDN_DOMAIN}:443?encryption=none&security=tls&sni=${CDN_DOMAIN}&fp=chrome&type=ws&host=${CDN_DOMAIN}&path=${path_enc}#${name}"
+
+    echo -e "  版本     : ${cyan}${XRAY_VERSION}${none}"
+    echo -e "  连接域名 : ${cyan}${CDN_DOMAIN}${none}  (客户端连它, 走 Cloudflare)"
+    echo -e "  源站 IP  : ${cyan}${ip}${none}  (填到 Cloudflare 的 A 记录)"
+    echo -e "  端口     : ${cyan}443${none}"
+    echo -e "  UUID     : ${cyan}${UUID}${none}"
+    echo -e "  传输     : ${cyan}VLESS + WS + TLS (经 Cloudflare CDN)${none}"
+    echo -e "  WS 路径  : ${cyan}${WS_PATH}${none}"
+    echo -e "  SNI/Host : ${cyan}${CDN_DOMAIN}${none}"
+    echo -e "  指纹 fp  : ${cyan}chrome${none}"
+    echo
+    echo -e "  导入链接 : ${green}${link}${none}"
+    echo
+    echo -e "  ${cyan}Clash.Meta / Mihomo${none}(原版 Clash 不支持 VLESS,必须用 Mihomo 内核):"
+    echo -e "  ${yellow}Clash Verge Rev:新建配置 → 类型选「Local / 本地」→ 粘贴整份 → 保存启用${none}"
+    echo
+    cat <<EOF
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+proxies:
+  - name: "${name}"
+    type: vless
+    server: ${CDN_DOMAIN}
+    port: 443
+    uuid: ${UUID}
+    udp: true
+    tls: true
+    servername: ${CDN_DOMAIN}
+    network: ws
+    client-fingerprint: chrome
+    ws-opts:
+      path: ${WS_PATH}
+      headers:
+        Host: ${CDN_DOMAIN}
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - "${name}"
+      - DIRECT
+rules:
+  - GEOIP,CN,DIRECT
+  - MATCH,PROXY
+EOF
+    echo
+    echo -e "  ${cyan}!! Cloudflare 必须配好这两步, 否则连不上 !!${none}"
+    echo -e "  ${yellow}1) DNS 加 A 记录: ${CDN_DOMAIN} → ${ip}, 橙色云(Proxied)必须开启${none}"
+    echo -e "  ${yellow}2) SSL/TLS 加密模式设为 Full(不是 Flexible, 也不是 Full strict)${none}"
+    echo -e "  ${yellow}   设完等几分钟让 CF 边缘证书变 Active, 再用客户端连${none}"
+}
+
 print_result() {
     echo
     echo "================= 安装完成 ================="
@@ -561,7 +740,11 @@ print_result() {
     echo
     echo "  管理命令 : systemctl {status|restart|stop} xray"
     echo "  配置文件 : ${XRAY_CONFIG}"
-    echo "  密钥备份 : ${XRAY_KEYS}"
+    if [[ "$MODE" == reality ]]; then
+        echo "  密钥备份 : ${XRAY_KEYS}"
+    else
+        echo "  证书目录 : ${XRAY_CERT_DIR}"
+    fi
     echo "--------------------------------------------"
     echo -e "  SSH 端口 : ${cyan}${SSH_PORT}${none}"
     echo -e "  登录用户 : ${cyan}${SSH_USER}${none} (已复制 root 公钥, 已加 sudo)"
@@ -594,29 +777,51 @@ show_info() {
     # 解析:沿用脚本一贯的「整体捕获 + bash 正则」写法,不经 grep|head 管道,
     # 避免在 set -o pipefail 下因 SIGPIPE 误伤(理由同 verify_config)。
     local content; content="$(cat "$XRAY_CONFIG")"
-    PORT=""; UUID=""; SNI=""; SHORT_ID=""
+
+    # 自动识别安装模式(Reality 直连 / CDN 套 WS),据此决定怎么解析与打印
+    if [[ "$content" == *realitySettings* ]]; then
+        MODE=reality
+    elif [[ "$content" == *wsSettings* ]]; then
+        MODE=cdn
+    else
+        die "无法识别配置类型(既非 Reality 也非 WS/CDN),${XRAY_CONFIG} 可能被改过"
+    fi
+
+    # 公共字段:端口 + UUID
+    PORT=""; UUID=""
     if [[ "$content" =~ \"port\"[[:space:]]*:[[:space:]]*([0-9]+) ]]; then PORT="${BASH_REMATCH[1]}"; fi
     if [[ "$content" =~ ([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}) ]]; then UUID="${BASH_REMATCH[1]}"; fi
-    if [[ "$content" =~ \"serverNames\"[[:space:]]*:[[:space:]]*\[[[:space:]]*\"([^\"]+)\" ]]; then SNI="${BASH_REMATCH[1]}"; fi
-    if [[ "$content" =~ \"shortIds\"[[:space:]]*:[[:space:]]*\[[[:space:]]*\"([^\"]*)\" ]]; then SHORT_ID="${BASH_REMATCH[1]}"; fi
-    [[ -n "$PORT" && -n "$UUID" && -n "$SNI" ]] || die "无法从 ${XRAY_CONFIG} 解析端口/UUID/SNI(配置可能被手动改过)"
+    [[ -n "$PORT" && -n "$UUID" ]] || die "无法从 ${XRAY_CONFIG} 解析端口/UUID(配置可能被手动改过)"
 
-    # 公钥:优先读备份文件,其次用 config 里的私钥反推(老/新版 xray 旗标可能不同,失败则标未知)
-    PUBLIC_KEY=""
-    if [[ -f "$XRAY_KEYS" ]]; then
-        local kc; kc="$(cat "$XRAY_KEYS")"
-        if [[ "$kc" =~ [Pp]ublic[Kk]ey:[[:space:]]*([A-Za-z0-9_-]+) ]]; then PUBLIC_KEY="${BASH_REMATCH[1]}"; fi
-    fi
-    if [[ -z "$PUBLIC_KEY" ]]; then
-        local priv=""
-        if [[ "$content" =~ \"privateKey\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9_-]+)\" ]]; then priv="${BASH_REMATCH[1]}"; fi
-        if [[ -n "$priv" && -x "$XRAY_BIN" ]]; then
-            # 新版 xray 用 `xray x25519 -i <私钥>` 反推公钥;输出格式同 gen,交给同一解析器
-            local d; d="$("$XRAY_BIN" x25519 -i "$priv" 2>/dev/null || true)"
-            _parse_x25519_keys "$d"   # 设置 PUBLIC_KEY(也会动全局 PRIVATE_KEY,info 不使用,无影响)
+    if [[ "$MODE" == reality ]]; then
+        SNI=""; SHORT_ID=""
+        if [[ "$content" =~ \"serverNames\"[[:space:]]*:[[:space:]]*\[[[:space:]]*\"([^\"]+)\" ]]; then SNI="${BASH_REMATCH[1]}"; fi
+        if [[ "$content" =~ \"shortIds\"[[:space:]]*:[[:space:]]*\[[[:space:]]*\"([^\"]*)\" ]]; then SHORT_ID="${BASH_REMATCH[1]}"; fi
+        [[ -n "$SNI" ]] || die "无法从 ${XRAY_CONFIG} 解析 SNI(配置可能被手动改过)"
+
+        # 公钥:优先读备份文件,其次用 config 里的私钥反推(老/新版 xray 旗标可能不同,失败则标未知)
+        PUBLIC_KEY=""
+        if [[ -f "$XRAY_KEYS" ]]; then
+            local kc; kc="$(cat "$XRAY_KEYS")"
+            if [[ "$kc" =~ [Pp]ublic[Kk]ey:[[:space:]]*([A-Za-z0-9_-]+) ]]; then PUBLIC_KEY="${BASH_REMATCH[1]}"; fi
         fi
+        if [[ -z "$PUBLIC_KEY" ]]; then
+            local priv=""
+            if [[ "$content" =~ \"privateKey\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9_-]+)\" ]]; then priv="${BASH_REMATCH[1]}"; fi
+            if [[ -n "$priv" && -x "$XRAY_BIN" ]]; then
+                # 新版 xray 用 `xray x25519 -i <私钥>` 反推公钥;输出格式同 gen,交给同一解析器
+                local d; d="$("$XRAY_BIN" x25519 -i "$priv" 2>/dev/null || true)"
+                _parse_x25519_keys "$d"   # 设置 PUBLIC_KEY(也会动全局 PRIVATE_KEY,info 不使用,无影响)
+            fi
+        fi
+        [[ -n "$PUBLIC_KEY" ]] || PUBLIC_KEY="(未知,请查看 ${XRAY_KEYS})"
+    else
+        # CDN:从 tlsSettings.serverName 取域名、wsSettings.path 取路径
+        CDN_DOMAIN=""; WS_PATH=""
+        if [[ "$content" =~ \"serverName\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then CDN_DOMAIN="${BASH_REMATCH[1]}"; fi
+        if [[ "$content" =~ \"path\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then WS_PATH="${BASH_REMATCH[1]}"; fi
+        [[ -n "$CDN_DOMAIN" && -n "$WS_PATH" ]] || die "无法从 ${XRAY_CONFIG} 解析域名/WS 路径(配置可能被手动改过)"
     fi
-    [[ -n "$PUBLIC_KEY" ]] || PUBLIC_KEY="(未知,请查看 ${XRAY_KEYS})"
 
     # 版本:整体捕获二进制输出取首行(不用 head,理由同 verify_config);取不到则标「未知」
     local vraw=""
@@ -652,6 +857,7 @@ uninstall() {
 # 注意:函数名不能叫 install,否则会覆盖 /usr/bin/install 命令,
 # 导致 download_and_verify 里的 `install -m 755 ...` 递归调用本函数而死循环。
 do_install() {
+    [[ "$MODE" =~ ^(reality|cdn)$ ]] || die "未知 MODE: $MODE (可用: reality | cdn)"
     precheck
     install_deps
     download_and_verify
@@ -670,7 +876,8 @@ do_install() {
 
 case "${1:-install}" in
     install)   do_install ;;
+    cdn)       MODE=cdn; do_install ;;
     uninstall) uninstall ;;
     info)      show_info ;;
-    *) die "未知参数: $1 (可用: install | uninstall | info)" ;;
+    *) die "未知参数: $1 (可用: install | cdn | uninstall | info)" ;;
 esac
