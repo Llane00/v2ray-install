@@ -33,7 +33,7 @@
 
 **什么时候上 CDN 模式**:Reality 抗识别很强,但藏不住「你在往一个固定境外 IP 持续灌大流量」这件事——当 IP 被 GFW 按行为 / 信誉**降权限速**时(典型表现:时好时坏、SSH 正常但代理抽风、流量也没超),换协议救不了,换 IP 最直接。如果**不想换 IP**,就用 CDN 模式把源站 IP 藏到 Cloudflare 后面,GFW 只看得到 CF 的 IP。
 
-> **CDN 模式的取舍**:它换来的是**可用性 / 抗封**(CF 的 IP 池极大,几乎封不死),但**不保证更快**——Cloudflare 免费版回国线路质量飘忽,高峰可能比直连还慢。可在客户端用 **Cloudflare 优选 IP** 改善。
+> **CDN 模式的取舍**:它换来的是**可用性 / 抗封**(CF 的 IP 池极大,几乎封不死),但**不保证更快**——Cloudflare 免费版回国线路质量飘忽,高峰可能比直连还慢。可在客户端用 **Cloudflare 优选 IP** 改善(方法见下方「使用方式 → CDN 模式延迟优化」一节)。
 
 ---
 
@@ -102,6 +102,43 @@ CDN_DOMAIN=cdn.你的域名 SSH_USER=你的登录用户名 bash install.sh cdn
 设完等几分钟,让 Cloudflare 的边缘证书变 Active,再用客户端连。源站用**自签证书**(CF「Full」模式不校验它),所以脚本零额外依赖、不需要 CF API token。
 
 > CDN 模式客户端走 **VLESS + WS + TLS**(不需要 Reality / Vision),兼容的客户端更多;但 Clash 仍需 Mihomo 内核(Clash Verge Rev)。
+
+### CDN 模式延迟优化:Cloudflare 优选 IP
+
+CDN 模式比直连多绕一层,且 **Cloudflare 免费版回国线路经常不优**(客户端可能被分到很远/很挤的 CF 节点),延迟会明显高于直连。解法是 **优选 IP**:让客户端连一个「从你这个网络实测延迟最低、速度又好」的 Cloudflare IP,而 **SNI / Host 仍保持你的域名**——CF 照样凭域名回源到你的 VPS,证书也照常受信。
+
+1. 下载 **[XIU2/CloudflareSpeedTest](https://github.com/XIU2/CloudflareSpeedTest/releases)**(选对应平台:macOS `cfst_darwin_amd64`、Linux `cfst_linux_amd64`、Windows `cfst_windows_amd64`)。
+
+2. **在你常用的设备 / 网络(国内)上跑**——结果按地点 / 运营商而定,必须本地测:
+
+   ```bash
+   cd <解压目录>
+   # macOS 首次运行被 Gatekeeper 拦的话,先解除隔离:
+   xattr -dr com.apple.quarantine .
+   chmod +x ./cfst && ./cfst
+   ```
+
+   结果写到 `result.csv`,表头:`IP, 发送, 接收, 丢包率, 平均延迟(ms), 下载速度(MB/s), 地区码`。
+
+3. **挑延迟低、下载速度也高的那个**——别只看延迟:很多低延迟 IP 速度只有 0.1 MB/s,刷视频会卡,要两者都好。地区码 `NRT`(东京)/ `HKG`(香港)/ `SIN`(新加坡)离国内近,通常更优。
+
+4. **改客户端**(只改连接地址,域名相关全保持)。Clash Meta:
+
+   ```yaml
+     - name: "CDN-cdn.你的域名"
+       server: 108.162.198.201          # ← 换成你测出的优选 IP(示例)
+       port: 443
+       servername: cdn.你的域名          # ← 保持域名(SNI)
+       network: ws
+       ws-opts:
+         path: /你的路径
+         headers:
+           Host: cdn.你的域名            # ← 保持域名(Host)
+   ```
+
+   `vless://` 链接则把 `@cdn.你的域名:443` 改成 `@优选IP:443`,链接里的 `sni=` / `host=` 仍保持域名。
+
+> 优选 IP 不是永久的,CF 节点状态会变,过段时间可重跑 `./cfst` 再选。延迟下限仍受 VPS 物理位置约束——机房离国内越近越低,优选也救不回一台远在美国的机器到「东京档」的延迟。
 
 ### 重新获取连接信息(已经装过的机器)
 
